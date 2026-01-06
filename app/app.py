@@ -13,14 +13,17 @@ import streamlit as st
 # -----------------------------
 # Path setup (robust imports)
 # -----------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (one level above /app)
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Ensure project root is importable so `import scripts...` works everywhere
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import your existing functions
 # These modules must exist in /scripts with these function names.
-from step_01_load_raw import load_patient_long  # type: ignore
-from step_02_batch_features import summarise_patient  # type: ignore
+from scripts.step_01_load_raw import load_patient_long
+from scripts.step_02_batch_features import summarise_patient
 
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
 DEFAULT_MEDIUM_THRESHOLD = 0.10  # your “medium risk” threshold
@@ -88,15 +91,18 @@ with st.expander("What this is (and isn’t)"):
         """
     )
 
-# Bundle path input
-bundle_path_str = st.text_input("Model bundle path", value=str(DEFAULT_BUNDLE_PATH))
-bundle_path = Path(bundle_path_str)
+# Load the bundled model from the repo only (prevents arbitrary local file reads)
+bundle_path = DEFAULT_BUNDLE_PATH
 
 if not bundle_path.exists():
-    st.error(f"Bundle not found: {bundle_path}")
+    st.error(
+        "Model bundle not found in the expected location: "
+        f"{bundle_path}. Make sure outputs/model_bundle.joblib is committed."
+    )
     st.stop()
 
 bundle = load_bundle(bundle_path)
+st.caption(f"Using bundled model: `{bundle_path.as_posix()}`")
 
 # Pull items from bundle
 model = bundle["model"]
@@ -124,6 +130,11 @@ st.divider()
 uploaded = st.file_uploader("Upload patient file (.txt)", type=["txt"])
 
 if uploaded is None:
+    st.stop()
+
+# basic anti-chaos: prevent huge uploads
+if uploaded.size > 2_000_000:  # 2MB
+    st.error("File too large for this demo (max 2MB).")
     st.stop()
 
 # Save uploaded file to a temp location because your loader expects a path
