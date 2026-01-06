@@ -1,0 +1,38 @@
+# -------------------------
+# OS / IDE
+# -------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# -------------------------
+# Python / environments
+# -------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# -------------------------
+# Data (never commit real data)
+# -------------------------
+data/raw/
+data/processed/
+
+# OPTIONAL: allow a safe sample folder if you make one later
+!data/sample/
+!data/sample/**
+
+# -------------------------
+# Outputs
+# - ignore everything by default
+# - allow only the artifacts needed for the demo/portfolio
+# -------------------------
+outputs/*
+!outputs/model_bundle.joblib
+!outputs/examples_by_riskband.csv
+!outputs/*.png
+
+SAVE_MODEL_SNIPPET.txt
