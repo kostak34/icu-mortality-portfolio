@@ -14,8 +14,14 @@ Notes:
 from __future__ import annotations
 
 from pathlib import Path
-import hashlib
 import sys
+
+# ✅ Ensure repo root is on sys.path so `import scripts...` works on Streamlit Cloud
+REPO_ROOT = Path(__file__).resolve().parents[1]  # app/app.py -> repo root
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
@@ -25,6 +31,7 @@ import streamlit as st
 
 from scripts.step_01_load_raw import load_patient_long  # type: ignore
 from scripts.step_02_batch_features import summarise_patient  # type: ignore
+
 
 
 # -----------------------------
