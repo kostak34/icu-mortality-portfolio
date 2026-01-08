@@ -7,8 +7,8 @@ Run locally:
 
 Notes:
 - Requires a saved model bundle at outputs/model_bundle.joblib
-- Allows a user to upload a single patient file (.txt) OR manually enter values
-  at 12h / 6h / now.
+- Upload mode: parse patient .txt → features → impute → predict
+- Manual mode: clinician enters values at 12h/6h/now → engineer mean/last → impute → predict
 - Educational demo only. Not for clinical use.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ from scripts.step_02_batch_features import summarise_patient  # type: ignore
 # Constants / helpers
 # -----------------------------
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
-DEFAULT_LOW_THRESHOLD = 0.10  # LOW < 0.10 (demo)
+DEFAULT_LOW_THRESHOLD = 0.10
 MAX_UPLOAD_BYTES = 2_000_000  # 2MB
 
 TIMEPOINTS = [
@@ -47,8 +47,10 @@ TIMEPOINTS = [
     ("Now", "t0"),
 ]
 
-# Clinician-friendly labels + units + plausible ranges for validation
-# (Anything not in here will still work, just with wide numeric bounds.)
+RISK_COLOR = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
+
+# Clinician-friendly labels + units + plausible ranges
+# (Anything not in here will still work with wide numeric bounds.)
 VAR_META: dict[str, dict[str, Any]] = {
     "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
     "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
@@ -57,7 +59,7 @@ VAR_META: dict[str, dict[str, Any]] = {
     "MeanBP": {"label": "Mean arterial pressure", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
     "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
     "SaO2": {"label": "Oxygen saturation", "units": "%", "min": 0.0, "max": 100.0, "type": "num"},
-    "FiO2": {"label": "FiO₂", "units": "% (e.g., 21–100)", "min": 21.0, "max": 100.0, "type": "fio2_percent"},
+    "FiO2": {"label": "FiO₂", "units": "% (21–100)", "min": 21.0, "max": 100.0, "type": "fio2_percent"},
     "pH": {"label": "pH", "units": "", "min": 6.6, "max": 7.8, "type": "num"},
     "Lactate": {"label": "Lactate", "units": "mmol/L", "min": 0.0, "max": 30.0, "type": "num"},
     "Glucose": {"label": "Glucose", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
@@ -68,8 +70,6 @@ VAR_META: dict[str, dict[str, Any]] = {
     "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
 }
 
-RISK_COLOR = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
-
 
 @st.cache_resource
 def load_bundle(bundle_path: Path) -> dict:
@@ -78,9 +78,7 @@ def load_bundle(bundle_path: Path) -> dict:
 
 def safe_float(x: Any) -> float | None:
     """Convert to float or return None if missing/unparseable."""
-    if x is None:
-        return None
-    if x is pd.NA:
+    if x is None or x is pd.NA:
         return None
     try:
         if isinstance(x, str) and x.strip() == "":
@@ -96,16 +94,19 @@ def align_and_impute(
     imputer,
 ) -> tuple[pd.DataFrame, int, list[str], pd.DataFrame]:
     """
-    Build one-row dataframe in training feature order,
-    report missing features, return imputed frame + aligned raw frame.
-    Critically: ensure NO pd.NA reaches sklearn (convert to np.nan).
+    Build one-row dataframe in training feature order, report missing features,
+    return imputed frame + aligned raw frame.
+
+    Critical: ensure NO pd.NA reaches sklearn (convert to np.nan).
     """
     X = pd.DataFrame([feats])
 
+    # Ensure all expected columns exist
     for c in feature_columns:
         if c not in X.columns:
             X[c] = np.nan
 
+    # Keep ONLY training columns in the correct order
     X = X[feature_columns]
 
     # Missing features (pre-imputation)
@@ -131,7 +132,7 @@ def risk_band(prob: float, thr_low: float, thr_high: float) -> str:
 
 
 def band_strip(current: str) -> None:
-    """Small, non-tacky band indicator that shows all three bands at once."""
+    """Compact band indicator showing all three bands."""
     cols = st.columns(3)
     for i, band in enumerate(["LOW", "MEDIUM", "HIGH"]):
         icon = RISK_COLOR[band]
@@ -145,7 +146,6 @@ def normalise_fio2_percent_to_fraction(v: float | None) -> float | None:
     """User enters FiO2 in %, model expects fraction."""
     if v is None:
         return None
-    # v should already be 21..100 by widget bounds
     return float(v) / 100.0
 
 
@@ -174,7 +174,6 @@ def manual_inputs_to_engineered_features(
 
         # Binary handling (e.g., MechVent)
         if meta.get("type") == "binary":
-            # values are "Missing" / "Yes" / "No"
             def yn_to_num(x: Any) -> float | None:
                 if x == "Yes":
                     return 1.0
@@ -196,7 +195,6 @@ def manual_inputs_to_engineered_features(
             feat[f"{var}_mean"] = mean_val
             feat[f"{var}_last"] = last_val
 
-            # special: MechVent_prop_on expected by your pipeline
             if var.lower() == "mechvent":
                 feat["MechVent_prop_on"] = mean_val if not np.isnan(mean_val) else np.nan
                 feat["MechVent_last"] = last_val if not np.isnan(last_val) else np.nan
@@ -208,7 +206,6 @@ def manual_inputs_to_engineered_features(
         v6 = safe_float(v6_raw)
         v0 = safe_float(v0_raw)
 
-        # Special: FiO2 entered in %, model expects fraction
         if meta.get("type") == "fio2_percent":
             v12 = normalise_fio2_percent_to_fraction(v12)
             v6 = normalise_fio2_percent_to_fraction(v6)
@@ -233,21 +230,20 @@ def manual_inputs_to_engineered_features(
 # -----------------------------
 st.set_page_config(page_title="ICU Mortality Demo", layout="centered")
 
-st.title("ICU Mortality Risk (Demo)")
-st.caption("Portfolio demonstration only — not a clinical decision tool.")
+st.title("ICU Mortality Prediction (Demo)")
+st.caption("Educational demo only. Not for clinical use.")
 
-with st.expander("What this tool is (and isn’t)"):
+with st.expander("What this is (and isn’t)"):
     st.write(
         """
-        This demo estimates a mortality risk **from routinely collected ICU observations and blood results**.
-        It is designed to show how a model could be packaged into a clinician-facing interface.
+        This demo estimates a mortality risk from routine ICU observations and blood results.
+        It is intended as a portfolio demonstration only.
 
-        **Important:** this is a **portfolio demo trained on public ICU data**.
         It has **not** been validated for real-world clinical use and must not be used for patient care.
         """
     )
 
-# Load bundle
+# Load bundle (fatal if missing)
 bundle_path = DEFAULT_BUNDLE_PATH
 if not bundle_path.exists():
     st.error("Model bundle not found. Expected: outputs/model_bundle.joblib")
@@ -262,7 +258,6 @@ thr_high = float(bundle.get("default_threshold", 0.5))
 thr_low = float(bundle.get("low_threshold", DEFAULT_LOW_THRESHOLD))
 starter_vars = bundle.get("starter_vars", None)
 
-# Clinician-facing thresholds (show all three bands clearly)
 st.subheader("Risk bands (demo cut-offs)")
 c1, c2, c3 = st.columns(3)
 c1.metric("LOW risk", f"< {thr_low:.3f}")
@@ -271,7 +266,7 @@ c3.metric("HIGH risk", f"≥ {thr_high:.3f}")
 
 st.divider()
 
-tab_upload, tab_manual = st.tabs(["Upload patient file (.txt)", "Manual entry (12h / 6h / now)"])
+tab_upload, tab_manual = st.tabs(["Upload patient file (.txt)", "Manual entry"])
 
 # -----------------------------
 # Upload mode
@@ -281,46 +276,42 @@ with tab_upload:
 
     if uploaded is None:
         st.info("Upload a patient file to generate a prediction.")
-        st.stop()
+    else:
+        if uploaded.size > MAX_UPLOAD_BYTES:
+            st.error("File too large for this demo (max 2MB).")
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+                tmp.write(uploaded.getbuffer())
+                tmp_path = Path(tmp.name)
 
-    if uploaded.size > MAX_UPLOAD_BYTES:
-        st.error("File too large for this demo (max 2MB).")
-        st.stop()
+            try:
+                long_df = load_patient_long(tmp_path)
+                feats = summarise_patient(long_df)
 
-    # Save uploaded file to a temp location because loader expects a path
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-        tmp.write(uploaded.getbuffer())
-        tmp_path = Path(tmp.name)
+                X_imp, present_count, missing_features, _ = align_and_impute(feats, feature_columns, imputer)
 
-    try:
-        long_df = load_patient_long(tmp_path)
-        feats = summarise_patient(long_df)
+                prob = float(model.predict_proba(X_imp)[:, 1][0])
+                band = risk_band(prob, thr_low, thr_high)
 
-        X_imp, present_count, missing_features, _X_aligned = align_and_impute(feats, feature_columns, imputer)
+                st.subheader("Result")
+                band_strip(band)
+                st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-        prob = float(model.predict_proba(X_imp)[:, 1][0])
-        band = risk_band(prob, thr_low, thr_high)
+                st.subheader("Data completeness")
+                st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
+                st.write(f"Missing features (imputed): **{len(missing_features)}**")
+                if missing_features:
+                    with st.expander("Show missing features"):
+                        st.write(missing_features)
 
-        st.subheader("Result")
-        band_strip(band)
-        st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
-
-        st.subheader("Data completeness")
-        st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-        st.write(f"Missing features (imputed): **{len(missing_features)}**")
-        if missing_features:
-            with st.expander("Show missing features"):
-                st.write(missing_features)
-
-    except Exception:
-        st.error("Something went wrong while predicting from the uploaded file.")
-        st.info("Tip: try a different patient file. This demo expects the same format used during training.")
-        st.stop()
-    finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            except Exception:
+                st.error("Something went wrong while predicting from the uploaded file.")
+                st.info("Tip: try a different patient file. This demo expects the same format used during training.")
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 # -----------------------------
 # Manual mode
@@ -328,90 +319,84 @@ with tab_upload:
 with tab_manual:
     if starter_vars is None or not isinstance(starter_vars, list) or len(starter_vars) == 0:
         st.warning("Manual entry is unavailable because this model bundle does not include `starter_vars`.")
-        st.stop()
+    else:
+        st.write(
+            """
+            Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
+            The model uses these to create the same kinds of features it was trained on (mean + most recent value).
+            """
+        )
 
-    st.write(
-        """
-        Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
-        The model uses these to create the features it was trained on (mean + most recent value).
-        """
-    )
+        inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
 
-    # Build input table: one row per variable, 3 columns for timepoints
-    inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
+        submitted = False
+        with st.form("manual_form", clear_on_submit=False):
+            for var in starter_vars:
+                meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+                label = meta.get("label", var)
+                units = meta.get("units", "")
+                vtype = meta.get("type", "num")
 
-    with st.form("manual_form", clear_on_submit=False):
-        for var in starter_vars:
-            meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
-            label = meta.get("label", var)
-            units = meta.get("units", "")
-            vtype = meta.get("type", "num")
+                st.markdown(f"### {label}" + (f" ({units})" if units else ""))
 
-            st.markdown(f"### {label}" + (f" ({units})" if units else ""))
+                cols = st.columns(3)
+                for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
+                    if vtype == "binary":
+                        inputs[var][tp_key] = cols[idx].selectbox(
+                            tp_label,
+                            options=["Missing", "Yes", "No"],
+                            index=0,
+                            key=f"{var}_{tp_key}_bin",
+                            help="Choose Yes / No. Leave as Missing if unknown.",
+                        )
+                    else:
+                        min_v = float(meta.get("min", -1e6))
+                        max_v = float(meta.get("max", 1e6))
+                        help_text = f"Enter a number. Expected range: {min_v:g}–{max_v:g}."
+                        if units:
+                            help_text += f" Units: {units}."
+                        if vtype == "fio2_percent":
+                            help_text = "Enter FiO₂ as a percentage (21–100)."
 
-            cols = st.columns(3)
-            for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
-                help_text = ""
-                if vtype == "binary":
-                    help_text = "Choose Yes / No. Leave as Missing if unknown."
-                    inputs[var][tp_key] = cols[idx].selectbox(
-                        tp_label,
-                        options=["Missing", "Yes", "No"],
-                        index=0,
-                        key=f"{var}_{tp_key}_bin",
-                        help=help_text,
-                    )
-                else:
-                    # Numeric (including FiO2 percent)
-                    min_v = float(meta.get("min", -1e6))
-                    max_v = float(meta.get("max", 1e6))
-                    help_text = f"Enter a number. Expected range: {min_v:g}–{max_v:g}."
-                    if units:
-                        help_text += f" Units: {units}."
-                    if vtype == "fio2_percent":
-                        help_text = "Enter FiO₂ as a percentage (21–100)."
+                        inputs[var][tp_key] = cols[idx].number_input(
+                            tp_label,
+                            min_value=min_v,
+                            max_value=max_v,
+                            value=None,
+                            step=1.0 if (max_v - min_v) > 50 else 0.1,
+                            key=f"{var}_{tp_key}_num",
+                            help=help_text,
+                            format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
+                        )
 
-                    inputs[var][tp_key] = cols[idx].number_input(
-                        tp_label,
-                        min_value=min_v,
-                        max_value=max_v,
-                        value=None,  # allow empty
-                        step=1.0 if (max_v - min_v) > 50 else 0.1,
-                        key=f"{var}_{tp_key}_num",
-                        help=help_text,
-                        format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
-                    )
+                st.divider()
 
-            st.divider()
+            submitted = st.form_submit_button("Calculate risk")
 
-        submitted = st.form_submit_button("Calculate risk")
+        # No st.stop() here — we just don't show results until submitted
+        if submitted:
+            try:
+                raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
+                X_imp, present_count, missing_features, _ = align_and_impute(raw_engineered, feature_columns, imputer)
 
-    if not submitted:
-        st.stop()
+                prob = float(model.predict_proba(X_imp)[:, 1][0])
+                band = risk_band(prob, thr_low, thr_high)
 
-    try:
-        raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
+                st.subheader("Result")
+                band_strip(band)
+                st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-        X_imp, present_count, missing_features, _X_aligned = align_and_impute(raw_engineered, feature_columns, imputer)
+                st.subheader("Data completeness")
+                st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
+                st.write(f"Missing features (imputed): **{len(missing_features)}**")
+                if missing_features:
+                    with st.expander("Show missing features"):
+                        st.write(missing_features)
 
-        prob = float(model.predict_proba(X_imp)[:, 1][0])
-        band = risk_band(prob, thr_low, thr_high)
+            except Exception:
+                st.error("Something went wrong while predicting from manual entry.")
+                st.info("Please check entries and try again.")
 
-        st.subheader("Result")
-        band_strip(band)
-        st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
-
-        st.subheader("Data completeness")
-        st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-        st.write(f"Missing features (imputed): **{len(missing_features)}**")
-        if missing_features:
-            with st.expander("Show missing features"):
-                st.write(missing_features)
-
-    except Exception:
-        st.error("Something went wrong while predicting from manual entry.")
-        st.info("Check any fields you left blank or any unusual values; then try again.")
-        st.stop()
 
 # -----------------------------
 # Technical details (bottom)
