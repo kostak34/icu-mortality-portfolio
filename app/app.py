@@ -1,307 +1,256 @@
-# app/app.py
+"""
+Streamlit demo app (educational).
+
+Run locally:
+  python -m pip install -r requirements.txt
+  python -m streamlit run app/app.py
+
+Notes:
+- Requires a saved model bundle at outputs/model_bundle.joblib
+- Allows a user to upload a single patient file (.txt) OR manually enter values
+  at 12h / 6h / now.
+- Educational demo only. Not for clinical use.
+"""
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ------------------------------------------------------------
-# Robust import setup (works locally + on Streamlit Cloud)
-# ------------------------------------------------------------
+# -----------------------------
+# Path setup (robust imports)
+# -----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Add BOTH the project root (for `import scripts...`) and scripts dir
-# (so older absolute imports inside scripts like `import step_01_load_raw` still work)
-for p in (PROJECT_ROOT, SCRIPTS_DIR):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
-# Your existing functions
 from scripts.step_01_load_raw import load_patient_long  # type: ignore
 from scripts.step_02_batch_features import summarise_patient  # type: ignore
 
+
+# -----------------------------
+# Constants / helpers
+# -----------------------------
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
-DEFAULT_MEDIUM_THRESHOLD = 0.10  # demo medium-risk threshold
+DEFAULT_LOW_THRESHOLD = 0.10  # LOW < 0.10 (demo)
+MAX_UPLOAD_BYTES = 2_000_000  # 2MB
+
+TIMEPOINTS = [
+    ("12 hours ago", "t12"),
+    ("6 hours ago", "t6"),
+    ("Now", "t0"),
+]
+
+# Clinician-friendly labels + units + plausible ranges for validation
+# (Anything not in here will still work, just with wide numeric bounds.)
+VAR_META: dict[str, dict[str, Any]] = {
+    "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
+    "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
+    "SysBP": {"label": "Systolic BP", "units": "mmHg", "min": 0.0, "max": 300.0, "type": "num"},
+    "DiasBP": {"label": "Diastolic BP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
+    "MeanBP": {"label": "Mean arterial pressure", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
+    "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
+    "SaO2": {"label": "Oxygen saturation", "units": "%", "min": 0.0, "max": 100.0, "type": "num"},
+    "FiO2": {"label": "FiO₂", "units": "% (e.g., 21–100)", "min": 21.0, "max": 100.0, "type": "fio2_percent"},
+    "pH": {"label": "pH", "units": "", "min": 6.6, "max": 7.8, "type": "num"},
+    "Lactate": {"label": "Lactate", "units": "mmol/L", "min": 0.0, "max": 30.0, "type": "num"},
+    "Glucose": {"label": "Glucose", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
+    "Creatinine": {"label": "Creatinine", "units": "µmol/L", "min": 0.0, "max": 2000.0, "type": "num"},
+    "BUN": {"label": "Urea (BUN)", "units": "mmol/L", "min": 0.0, "max": 80.0, "type": "num"},
+    "WBC": {"label": "White cell count", "units": "x10⁹/L", "min": 0.0, "max": 200.0, "type": "num"},
+    "Platelets": {"label": "Platelets", "units": "x10⁹/L", "min": 0.0, "max": 2000.0, "type": "num"},
+    "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
+}
+
+RISK_COLOR = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
 @st.cache_resource
 def load_bundle(bundle_path: Path) -> dict:
     return joblib.load(bundle_path)
 
 
-def risk_band(prob: float, thr_medium: float, thr_high: float) -> str:
-    if prob < thr_medium:
+def safe_float(x: Any) -> float | None:
+    """Convert to float or return None if missing/unparseable."""
+    if x is None:
+        return None
+    if x is pd.NA:
+        return None
+    try:
+        if isinstance(x, str) and x.strip() == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def align_and_impute(
+    feats: dict,
+    feature_columns: list[str],
+    imputer,
+) -> tuple[pd.DataFrame, int, list[str], pd.DataFrame]:
+    """
+    Build one-row dataframe in training feature order,
+    report missing features, return imputed frame + aligned raw frame.
+    Critically: ensure NO pd.NA reaches sklearn (convert to np.nan).
+    """
+    X = pd.DataFrame([feats])
+
+    for c in feature_columns:
+        if c not in X.columns:
+            X[c] = np.nan
+
+    X = X[feature_columns]
+
+    # Missing features (pre-imputation)
+    missing_mask = X.isna().iloc[0]
+    missing_features = X.columns[missing_mask].tolist()
+    present_count = int((~missing_mask).sum())
+
+    # Ensure sklearn-safe: no pd.NA, numeric dtype
+    X = X.replace({pd.NA: np.nan})
+    X = X.where(pd.notna(X), np.nan)
+    X = X.apply(pd.to_numeric, errors="coerce").astype("float64")
+
+    X_imp = pd.DataFrame(imputer.transform(X), columns=feature_columns)
+    return X_imp, present_count, missing_features, X
+
+
+def risk_band(prob: float, thr_low: float, thr_high: float) -> str:
+    if prob < thr_low:
         return "LOW"
     if prob < thr_high:
         return "MEDIUM"
     return "HIGH"
 
 
-def render_risk_pill(band: str) -> None:
-    # compact, non-tacky badge
-    styles = {
-        "LOW":    ("#0f5132", "#d1e7dd"),
-        "MEDIUM": ("#664d03", "#fff3cd"),
-        "HIGH":   ("#842029", "#f8d7da"),
-    }
-    fg, bg = styles.get(band, ("#0b0f14", "#e9ecef"))
-    st.markdown(
-        f"""
-        <div style="
-            display:inline-block;
-            padding:6px 10px;
-            border-radius:999px;
-            background:{bg};
-            color:{fg};
-            font-weight:600;
-            font-size:0.95rem;
-            line-height:1;
-        ">
-            Risk band: {band}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def band_strip(current: str) -> None:
+    """Small, non-tacky band indicator that shows all three bands at once."""
+    cols = st.columns(3)
+    for i, band in enumerate(["LOW", "MEDIUM", "HIGH"]):
+        icon = RISK_COLOR[band]
+        if band == current:
+            cols[i].markdown(f"**{icon} {band}**")
+        else:
+            cols[i].markdown(f"{icon} {band}")
 
 
-def _coerce_numeric_frame(X: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert any pd.NA/None/object → np.nan and coerce to numeric.
-    This is the critical part that prevents NAType crashes in sklearn.
-    """
-    X = X.copy()
-    X = X.where(pd.notna(X), np.nan)
-    # coerce everything to numeric; non-numeric becomes NaN
-    for c in X.columns:
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-    # ensure float dtype for sklearn
-    return X.astype(float)
-
-
-def align_and_impute(
-    feats: dict,
-    feature_columns: List[str],
-    imputer: Any,
-) -> Tuple[pd.DataFrame, int, List[str], pd.DataFrame]:
-    """
-    Align engineered feature dict to the training columns and impute.
-    Returns:
-      X_imp, present_count, missing_features, X_aligned (pre-imputation, aligned)
-    """
-    X = pd.DataFrame([feats])
-
-    # Add any missing expected columns as NaN
-    for c in feature_columns:
-        if c not in X.columns:
-            X[c] = np.nan
-
-    # Drop any extras and keep training order
-    X = X[feature_columns]
-
-    missing_mask = X.isna().iloc[0]
-    missing_features = X.columns[missing_mask].tolist()
-    present_count = int((~missing_mask).sum())
-
-    X_num = _coerce_numeric_frame(X)
-
-    # Impute using the fitted training imputer
-    X_imp_arr = imputer.transform(X_num)
-    X_imp = pd.DataFrame(X_imp_arr, columns=feature_columns)
-
-    return X_imp, present_count, missing_features, X
-
-
-# ------------------------------------------------------------
-# Manual entry schema + parsing
-# ------------------------------------------------------------
-def parse_optional_float(text: str) -> Tuple[float | None, str | None]:
-    """
-    Returns (value or None, error_message or None)
-    Empty -> None
-    """
-    if text is None:
-        return None, None
-    s = str(text).strip()
-    if s == "":
-        return None, None
-    try:
-        return float(s), None
-    except Exception:
-        return None, "Please enter a number (e.g., 6.2) or leave blank if unknown."
-
-
-def validate_range(
-    var_label: str,
-    value: float,
-    lo: float,
-    hi: float,
-    units: str,
-) -> str | None:
-    if value < lo or value > hi:
-        return f"{var_label}: please enter a value between {lo:g} and {hi:g}{(' ' + units) if units else ''}."
-    return None
-
-
-def fio2_to_fraction(value: float) -> float | None:
-    """
-    Accept either fraction (0.21–1.0) or percent (21–100).
-    Convert percent → fraction.
-    """
-    if value is None:
+def normalise_fio2_percent_to_fraction(v: float | None) -> float | None:
+    """User enters FiO2 in %, model expects fraction."""
+    if v is None:
         return None
-    if value > 1.5:  # treat as %
-        return value / 100.0
-    return value
+    # v should already be 21..100 by widget bounds
+    return float(v) / 100.0
 
 
-def last_from_timepoints(v12: float | None, v6: float | None, v0: float | None) -> float | None:
-    return v0 if v0 is not None else (v6 if v6 is not None else v12)
+def manual_inputs_to_engineered_features(
+    inputs: dict[str, dict[str, Any]],
+    starter_vars: list[str],
+) -> dict:
+    """
+    Convert clinician-entered values (12h/6h/now) into the engineered features
+    the model expects: {var}_was_measured, {var}_mean, {var}_last
+    plus MechVent_prop_on.
+    """
+    feat: dict[str, Any] = {}
 
-
-def mean_from_timepoints(vals: List[float | None]) -> float | None:
-    clean = [v for v in vals if v is not None]
-    if not clean:
+    def latest_value(t0, t6, t12):
+        for v in [t0, t6, t12]:
+            if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                return v
         return None
-    return float(np.mean(clean))
 
+    for var in starter_vars:
+        meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+        v12_raw = inputs.get(var, {}).get("t12", None)
+        v6_raw = inputs.get(var, {}).get("t6", None)
+        v0_raw = inputs.get(var, {}).get("t0", None)
 
-def build_manual_features(
-    inputs: Dict[str, Dict[str, Any]],
-) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    """
-    inputs[var] = {"t12": ..., "t6": ..., "t0": ...} (strings or for MechVent: option)
-    Returns: (feats, errors, warnings)
-    """
-    errors: List[str] = []
-    warnings: List[str] = []
-    feats: Dict[str, Any] = {}
+        # Binary handling (e.g., MechVent)
+        if meta.get("type") == "binary":
+            # values are "Missing" / "Yes" / "No"
+            def yn_to_num(x: Any) -> float | None:
+                if x == "Yes":
+                    return 1.0
+                if x == "No":
+                    return 0.0
+                return None
 
-    # Clinician-facing specs (hard-ish ranges)
-    # (You can tweak these anytime)
-    specs = {
-        "HR":       {"label": "Heart rate",         "units": "bpm",   "lo": 0,   "hi": 250},
-        "RespRate": {"label": "Respiratory rate",   "units": "/min",  "lo": 0,   "hi": 80},
-        "SysBP":    {"label": "Systolic BP",        "units": "mmHg",  "lo": 0,   "hi": 300},
-        "DiasBP":   {"label": "Diastolic BP",       "units": "mmHg",  "lo": 0,   "hi": 200},
-        "MAP":      {"label": "Mean arterial BP",   "units": "mmHg",  "lo": 0,   "hi": 200},
-        "Temp":     {"label": "Temperature",        "units": "°C",    "lo": 25,  "hi": 45},
-        "SaO2":     {"label": "Oxygen saturation",  "units": "%",     "lo": 0,   "hi": 100},
-        "FiO2":     {"label": "FiO₂",               "units": "",      "lo": 0.21,"hi": 1.0},
-        "pH":       {"label": "pH",                 "units": "",      "lo": 6.8, "hi": 7.8},
-        "Lactate":  {"label": "Lactate",            "units": "mmol/L", "lo": 0,   "hi": 30},
-        "Glucose":  {"label": "Glucose",            "units": "mmol/L", "lo": 0,   "hi": 60},
-        # Add more if you want stricter validation for other labs later
-    }
+            v12 = yn_to_num(v12_raw)
+            v6 = yn_to_num(v6_raw)
+            v0 = yn_to_num(v0_raw)
 
-    # MechVent is special (Yes/No/Unknown)
-    if "MechVent" in inputs:
-        mv_vals: List[float | None] = []
-        for tkey in ("t12", "t6", "t0"):
-            opt = inputs["MechVent"].get(tkey, "Unknown")
-            if opt == "Yes":
-                mv_vals.append(1.0)
-            elif opt == "No":
-                mv_vals.append(0.0)
-            else:
-                mv_vals.append(None)
+            series = [v for v in [v12, v6, v0] if v is not None]
+            feat[f"{var}_was_measured"] = 1 if len(series) > 0 else 0
 
-        feats["MechVent_was_measured"] = 1 if any(v is not None for v in mv_vals) else 0
-        feats["MechVent_mean"] = mean_from_timepoints(mv_vals) if feats["MechVent_was_measured"] else np.nan
-        last_mv = last_from_timepoints(mv_vals[0], mv_vals[1], mv_vals[2])
-        feats["MechVent_last"] = last_mv if last_mv is not None else np.nan
-        feats["MechVent_prop_on"] = feats["MechVent_mean"]  # same idea in this simplified manual mode
+            mean_val = float(np.mean(series)) if len(series) > 0 else np.nan
+            last_val = latest_value(v0, v6, v12)
+            last_val = float(last_val) if last_val is not None else np.nan
 
-    # Other numeric vars
-    for var, tvals in inputs.items():
-        if var == "MechVent":
+            feat[f"{var}_mean"] = mean_val
+            feat[f"{var}_last"] = last_val
+
+            # special: MechVent_prop_on expected by your pipeline
+            if var.lower() == "mechvent":
+                feat["MechVent_prop_on"] = mean_val if not np.isnan(mean_val) else np.nan
+                feat["MechVent_last"] = last_val if not np.isnan(last_val) else np.nan
+
             continue
 
-        v12_raw, e12 = parse_optional_float(tvals.get("t12", ""))
-        v6_raw,  e6  = parse_optional_float(tvals.get("t6", ""))
-        v0_raw,  e0  = parse_optional_float(tvals.get("t0", ""))
+        # Numeric handling
+        v12 = safe_float(v12_raw)
+        v6 = safe_float(v6_raw)
+        v0 = safe_float(v0_raw)
 
-        # Friendly parse errors
-        if e12:
-            errors.append(f"{var} (12h): {e12}")
-        if e6:
-            errors.append(f"{var} (6h): {e6}")
-        if e0:
-            errors.append(f"{var} (now): {e0}")
+        # Special: FiO2 entered in %, model expects fraction
+        if meta.get("type") == "fio2_percent":
+            v12 = normalise_fio2_percent_to_fraction(v12)
+            v6 = normalise_fio2_percent_to_fraction(v6)
+            v0 = normalise_fio2_percent_to_fraction(v0)
 
-        # Special: FiO2 accepts % or fraction; convert if needed, then validate fraction range
-        if var == "FiO2":
-            v12 = fio2_to_fraction(v12_raw) if v12_raw is not None else None
-            v6  = fio2_to_fraction(v6_raw)  if v6_raw is not None else None
-            v0  = fio2_to_fraction(v0_raw)  if v0_raw is not None else None
+        series = [v for v in [v12, v6, v0] if v is not None]
+        feat[f"{var}_was_measured"] = 1 if len(series) > 0 else 0
 
-            # validate post-conversion
-            spec = specs["FiO2"]
-            for label, v in [("12h", v12), ("6h", v6), ("now", v0)]:
-                if v is not None:
-                    msg = validate_range(spec["label"], v, spec["lo"], spec["hi"], spec["units"])
-                    if msg:
-                        errors.append(f"{msg} (at {label}). Use fraction 0.21–1.0 or % 21–100.")
+        if len(series) == 0:
+            feat[f"{var}_mean"] = np.nan
+            feat[f"{var}_last"] = np.nan
         else:
-            v12, v6, v0 = v12_raw, v6_raw, v0_raw
-            # validate if we have a spec
-            if var in specs:
-                spec = specs[var]
-                for label, v in [("12h", v12), ("6h", v6), ("now", v0)]:
-                    if v is not None:
-                        msg = validate_range(spec["label"], v, spec["lo"], spec["hi"], spec["units"])
-                        if msg:
-                            errors.append(f"{msg} (at {label}).")
+            feat[f"{var}_mean"] = float(np.mean(series))
+            last_val = latest_value(v0, v6, v12)
+            feat[f"{var}_last"] = float(last_val) if last_val is not None else np.nan
 
-        any_measured = any(v is not None for v in (v12, v6, v0))
-        feats[f"{var}_was_measured"] = 1 if any_measured else 0
-
-        if not any_measured:
-            feats[f"{var}_mean"] = np.nan
-            feats[f"{var}_last"] = np.nan
-        else:
-            feats[f"{var}_mean"] = mean_from_timepoints([v12, v6, v0]) or np.nan
-            last_v = last_from_timepoints(v12, v6, v0)
-            feats[f"{var}_last"] = last_v if last_v is not None else np.nan
-
-    return feats, errors, warnings
+    return feat
 
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-st.set_page_config(page_title="ICU Mortality Risk Demo", layout="centered")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="ICU Mortality Demo", layout="centered")
 
-st.title("ICU Mortality Risk Demo")
-st.caption("Educational portfolio demo — not for clinical decision-making.")
+st.title("ICU Mortality Risk (Demo)")
+st.caption("Portfolio demonstration only — not a clinical decision tool.")
 
-with st.expander("What this tool is (and what it isn’t)"):
+with st.expander("What this tool is (and isn’t)"):
     st.write(
         """
-        This demo shows how a risk tool could work end-to-end: it can take patient data, summarise it,
-        and provide a **risk estimate** with **simple categories**.
+        This demo estimates a mortality risk **from routinely collected ICU observations and blood results**.
+        It is designed to show how a model could be packaged into a clinician-facing interface.
 
-        It is **not a validated clinical device** and the categories here are **demo thresholds**.
-        Think of it like a **prototype** designed to demonstrate the workflow and UI, not a bedside tool.
+        **Important:** this is a **portfolio demo trained on public ICU data**.
+        It has **not** been validated for real-world clinical use and must not be used for patient care.
         """
     )
 
 # Load bundle
 bundle_path = DEFAULT_BUNDLE_PATH
 if not bundle_path.exists():
-    st.error(
-        "Model bundle not found. Expected: outputs/model_bundle.joblib\n\n"
-        "Make sure it exists in the repo and is committed."
-    )
+    st.error("Model bundle not found. Expected: outputs/model_bundle.joblib")
     st.stop()
 
 bundle = load_bundle(bundle_path)
@@ -310,210 +259,164 @@ imputer = bundle["imputer"]
 feature_columns = bundle["feature_columns"]
 
 thr_high = float(bundle.get("default_threshold", 0.5))
-thr_medium = float(bundle.get("medium_threshold", DEFAULT_MEDIUM_THRESHOLD))
-
+thr_low = float(bundle.get("low_threshold", DEFAULT_LOW_THRESHOLD))
 starter_vars = bundle.get("starter_vars", None)
 
-# Keep clinician UI clean: show thresholds briefly, and hide the rest under “Technical details”
-st.write("")
-colA, colB = st.columns(2)
-with colA:
-    st.metric("High-risk threshold", f"{thr_high:.3f}")
-with colB:
-    st.metric("Medium threshold", f"{thr_medium:.3f}")
+# Clinician-facing thresholds (show all three bands clearly)
+st.subheader("Risk bands (demo cut-offs)")
+c1, c2, c3 = st.columns(3)
+c1.metric("LOW risk", f"< {thr_low:.3f}")
+c2.metric("MEDIUM risk", f"{thr_low:.3f} to {thr_high:.3f}")
+c3.metric("HIGH risk", f"≥ {thr_high:.3f}")
 
-with st.expander("Technical details (for reviewers)"):
-    st.write(f"- Model bundle: `{bundle_path.as_posix()}`")
-    st.write(f"- Features expected: **{len(feature_columns)}**")
-    if starter_vars is None:
-        st.warning("Bundle does not store `starter_vars` (feature engineering drift risk).")
-    else:
-        st.info(f"Bundle starter_vars loaded: {len(starter_vars)} variables")
+st.divider()
 
-tabs = st.tabs(["Upload patient file (.txt)", "Manual entry"])
+tab_upload, tab_manual = st.tabs(["Upload patient file (.txt)", "Manual entry (12h / 6h / now)"])
 
-# ------------------------------------------------------------
-# TAB 1: Upload .txt
-# ------------------------------------------------------------
-with tabs[0]:
-    st.subheader("Upload patient file")
-    st.write("Upload a single ICU patient `.txt` file (demo format) to generate a prediction.")
+# -----------------------------
+# Upload mode
+# -----------------------------
+with tab_upload:
+    uploaded = st.file_uploader("Upload a single patient .txt file", type=["txt"])
 
-    uploaded = st.file_uploader("Patient file (.txt)", type=["txt"])
+    if uploaded is None:
+        st.info("Upload a patient file to generate a prediction.")
+        st.stop()
 
-    if uploaded is not None:
-        if uploaded.size > 2_000_000:
-            st.error("File too large for this demo (max 2MB).")
-            st.stop()
+    if uploaded.size > MAX_UPLOAD_BYTES:
+        st.error("File too large for this demo (max 2MB).")
+        st.stop()
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-            tmp.write(uploaded.getbuffer())
-            tmp_path = Path(tmp.name)
+    # Save uploaded file to a temp location because loader expects a path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+        tmp.write(uploaded.getbuffer())
+        tmp_path = Path(tmp.name)
 
+    try:
+        long_df = load_patient_long(tmp_path)
+        feats = summarise_patient(long_df)
+
+        X_imp, present_count, missing_features, _X_aligned = align_and_impute(feats, feature_columns, imputer)
+
+        prob = float(model.predict_proba(X_imp)[:, 1][0])
+        band = risk_band(prob, thr_low, thr_high)
+
+        st.subheader("Result")
+        band_strip(band)
+        st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
+
+        st.subheader("Data completeness")
+        st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
+        st.write(f"Missing features (imputed): **{len(missing_features)}**")
+        if missing_features:
+            with st.expander("Show missing features"):
+                st.write(missing_features)
+
+    except Exception:
+        st.error("Something went wrong while predicting from the uploaded file.")
+        st.info("Tip: try a different patient file. This demo expects the same format used during training.")
+        st.stop()
+    finally:
         try:
-            long_df = load_patient_long(tmp_path)
-            feats = summarise_patient(long_df)
-
-            X_imp, present_count, missing_features, X_aligned = align_and_impute(
-                feats, feature_columns, imputer
-            )
-
-            prob = float(model.predict_proba(X_imp)[:, 1][0])
-            band = risk_band(prob, thr_medium, thr_high)
-
-            st.subheader("Result")
-            st.metric("Predicted mortality risk", f"{prob*100:.2f}%")
-            render_risk_pill(band)
-            st.progress(min(max(prob, 0.0), 1.0))
-
-            st.subheader("Data completeness")
-            st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-            st.write(f"Missing (imputed): **{len(missing_features)}**")
-            if missing_features:
-                with st.expander("Show missing features"):
-                    st.write(missing_features)
-
-            # Show ONLY non-null engineered values (so it’s not a wall of None)
-            with st.expander("Show engineered values (non-missing only)"):
-                row = X_aligned.iloc[0]
-                non_missing = row[row.notna()]
-                if non_missing.empty:
-                    st.info("No engineered values were available.")
-                else:
-                    st.dataframe(non_missing.reset_index().rename(columns={"index": "feature", 0: "value"}))
-
+            tmp_path.unlink(missing_ok=True)
         except Exception:
-            st.error("Something went wrong while predicting. Please check the uploaded file format.")
-            st.stop()
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            pass
 
+# -----------------------------
+# Manual mode
+# -----------------------------
+with tab_manual:
+    if starter_vars is None or not isinstance(starter_vars, list) or len(starter_vars) == 0:
+        st.warning("Manual entry is unavailable because this model bundle does not include `starter_vars`.")
+        st.stop()
 
-# ------------------------------------------------------------
-# TAB 2: Manual entry (12h / 6h / now)
-# ------------------------------------------------------------
-with tabs[1]:
-    st.subheader("Manual entry")
     st.write(
-        "Enter a few commonly recorded values. Leave anything unknown blank. "
-        "This will approximate the features used by the model."
+        """
+        Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
+        The model uses these to create the features it was trained on (mean + most recent value).
+        """
     )
 
-    # We can default to starter_vars if stored, otherwise a sensible shortlist.
-    default_vars = [
-        "HR", "RespRate", "SysBP", "DiasBP", "MAP", "Temp",
-        "SaO2", "FiO2", "pH", "Lactate", "Glucose", "MechVent"
-    ]
-    vars_to_use = starter_vars if isinstance(starter_vars, list) and len(starter_vars) > 0 else default_vars
-
-    # Ensure MechVent is included if you want it
-    if "MechVent" not in vars_to_use:
-        vars_to_use = list(vars_to_use) + ["MechVent"]
-
-    # Clinician labels + units shown in UI (friendly)
-    display = {
-        "HR": ("Heart rate", "bpm", "e.g., 88"),
-        "RespRate": ("Respiratory rate", "/min", "e.g., 18"),
-        "SysBP": ("Systolic BP", "mmHg", "e.g., 118"),
-        "DiasBP": ("Diastolic BP", "mmHg", "e.g., 68"),
-        "MAP": ("Mean arterial pressure", "mmHg", "e.g., 82"),
-        "Temp": ("Temperature", "°C", "e.g., 36.8"),
-        "SaO2": ("Oxygen saturation", "%", "e.g., 94"),
-        "FiO2": ("FiO₂", "fraction or %", "e.g., 0.40 or 40"),
-        "pH": ("pH", "", "e.g., 7.36"),
-        "Lactate": ("Lactate", "mmol/L", "e.g., 1.8"),
-        "Glucose": ("Glucose", "mmol/L", "e.g., 6.2"),
-        "MechVent": ("Invasive ventilation", "", ""),
-    }
-
-    manual_inputs: Dict[str, Dict[str, Any]] = {}
+    # Build input table: one row per variable, 3 columns for timepoints
+    inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
 
     with st.form("manual_form", clear_on_submit=False):
-        st.write("**Timepoints**: 12 hours ago / 6 hours ago / now")
+        for var in starter_vars:
+            meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+            label = meta.get("label", var)
+            units = meta.get("units", "")
+            vtype = meta.get("type", "num")
 
-        header = st.columns([2.2, 1.2, 1.2, 1.2])
-        header[0].markdown("**Measure**")
-        header[1].markdown("**12h ago**")
-        header[2].markdown("**6h ago**")
-        header[3].markdown("**Now**")
+            st.markdown(f"### {label}" + (f" ({units})" if units else ""))
 
-        for var in vars_to_use:
-            label, units, placeholder = display.get(var, (var, "", ""))
-            row = st.columns([2.2, 1.2, 1.2, 1.2])
+            cols = st.columns(3)
+            for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
+                help_text = ""
+                if vtype == "binary":
+                    help_text = "Choose Yes / No. Leave as Missing if unknown."
+                    inputs[var][tp_key] = cols[idx].selectbox(
+                        tp_label,
+                        options=["Missing", "Yes", "No"],
+                        index=0,
+                        key=f"{var}_{tp_key}_bin",
+                        help=help_text,
+                    )
+                else:
+                    # Numeric (including FiO2 percent)
+                    min_v = float(meta.get("min", -1e6))
+                    max_v = float(meta.get("max", 1e6))
+                    help_text = f"Enter a number. Expected range: {min_v:g}–{max_v:g}."
+                    if units:
+                        help_text += f" Units: {units}."
+                    if vtype == "fio2_percent":
+                        help_text = "Enter FiO₂ as a percentage (21–100)."
 
-            row[0].markdown(f"**{label}**  \n<small>{units}</small>", unsafe_allow_html=True)
+                    inputs[var][tp_key] = cols[idx].number_input(
+                        tp_label,
+                        min_value=min_v,
+                        max_value=max_v,
+                        value=None,  # allow empty
+                        step=1.0 if (max_v - min_v) > 50 else 0.1,
+                        key=f"{var}_{tp_key}_num",
+                        help=help_text,
+                        format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
+                    )
 
-            if var == "MechVent":
-                # Unknown/No/Yes prevents “random numbers”
-                manual_inputs[var] = {
-                    "t12": row[1].selectbox("", ["Unknown", "No", "Yes"], key=f"{var}_12"),
-                    "t6":  row[2].selectbox("", ["Unknown", "No", "Yes"], key=f"{var}_6"),
-                    "t0":  row[3].selectbox("", ["Unknown", "No", "Yes"], key=f"{var}_0"),
-                }
-            else:
-                # text_input allows blank; we validate + coerce to float.
-                help_txt = placeholder
-                if var == "FiO2":
-                    help_txt = "Enter fraction 0.21–1.0 OR % 21–100 (we auto-convert)."
-
-                manual_inputs[var] = {
-                    "t12": row[1].text_input("", value="", placeholder=placeholder, key=f"{var}_12"),
-                    "t6":  row[2].text_input("", value="", placeholder=placeholder, key=f"{var}_6"),
-                    "t0":  row[3].text_input("", value="", placeholder=placeholder, key=f"{var}_0"),
-                }
-
-                # small guidance under the now-column (keeps UI tidy)
-                if var in ("FiO2",):
-                    row[3].caption(help_txt)
+            st.divider()
 
         submitted = st.form_submit_button("Calculate risk")
 
-    if submitted:
-        raw_engineered, errs, warns = build_manual_features(manual_inputs)
+    if not submitted:
+        st.stop()
 
-        if errs:
-            st.error("Please fix the following before calculating risk:")
-            for e in errs[:12]:
-                st.write(f"- {e}")
-            if len(errs) > 12:
-                st.write(f"- …and {len(errs) - 12} more.")
-            st.stop()
+    try:
+        raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
 
-        # Align + impute + predict
-        try:
-            X_imp, present_count, missing_features, X_aligned = align_and_impute(
-                raw_engineered, feature_columns, imputer
-            )
+        X_imp, present_count, missing_features, _X_aligned = align_and_impute(raw_engineered, feature_columns, imputer)
 
-            prob = float(model.predict_proba(X_imp)[:, 1][0])
-            band = risk_band(prob, thr_medium, thr_high)
+        prob = float(model.predict_proba(X_imp)[:, 1][0])
+        band = risk_band(prob, thr_low, thr_high)
 
-            st.subheader("Result")
-            st.metric("Predicted mortality risk", f"{prob*100:.2f}%")
-            render_risk_pill(band)
-            st.progress(min(max(prob, 0.0), 1.0))
+        st.subheader("Result")
+        band_strip(band)
+        st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-            st.subheader("Data completeness")
-            st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-            st.write(f"Missing (imputed): **{len(missing_features)}**")
-            if missing_features:
-                with st.expander("Show missing features"):
-                    st.write(missing_features)
+        st.subheader("Data completeness")
+        st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
+        st.write(f"Missing features (imputed): **{len(missing_features)}**")
+        if missing_features:
+            with st.expander("Show missing features"):
+                st.write(missing_features)
 
-            with st.expander("Show engineered values used (non-missing only)"):
-                row = X_aligned.iloc[0]
-                non_missing = row[row.notna()]
-                if non_missing.empty:
-                    st.info("No engineered values were available.")
-                else:
-                    st.dataframe(non_missing.reset_index().rename(columns={"index": "feature", 0: "value"}))
+    except Exception:
+        st.error("Something went wrong while predicting from manual entry.")
+        st.info("Check any fields you left blank or any unusual values; then try again.")
+        st.stop()
 
-        except Exception:
-            st.error(
-                "Something went wrong while calculating risk. "
-                "This usually means too many fields were left blank or a value format was unexpected."
-            )
-            st.stop()
+# -----------------------------
+# Technical details (bottom)
+# -----------------------------
+with st.expander("Technical details (for reviewers / developers)"):
+    st.write(f"Bundle path: `{bundle_path.as_posix()}`")
+    st.write(f"Features expected: {len(feature_columns)}")
+    st.write(f"Starter vars in bundle: {len(starter_vars) if isinstance(starter_vars, list) else 'missing'}")
