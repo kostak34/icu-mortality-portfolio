@@ -129,6 +129,14 @@ def humanise_feature_name(name: str) -> str:
     return VAR_META.get(name, {}).get("label", name)
 
 
+def bullet_list(items: list[str]) -> None:
+    """Render a clean clinician-friendly list (no brackets/quotes)."""
+    if not items:
+        st.write("None.")
+        return
+    st.markdown("\n".join([f"- {x}" for x in items]))
+
+
 def align_and_impute(
     feats: dict,
     feature_columns: list[str],
@@ -188,10 +196,6 @@ def get_uncalibrated_estimator(model_obj: Any) -> Any:
 
 
 def format_push(v: float) -> str:
-    """
-    Convert SHAP contributions into clinician-friendly 'push' text.
-    Positive -> pushes risk up; negative -> pushes risk down.
-    """
     arrow = "↑" if v > 0 else ("↓" if v < 0 else "→")
     return f"{arrow} {v:+.4f}"
 
@@ -203,11 +207,10 @@ def try_shap_explain(
     top_k: int = 8,
 ) -> tuple[bool, str, pd.DataFrame | None]:
     if not SHAP_AVAILABLE:
-        return False, "Explainability isn't available in this environment (SHAP not installed).", None
+        return False, "Explainable AI isn't available here (SHAP isn't installed).", None
 
     try:
         base_est = get_uncalibrated_estimator(model_obj)
-
         explainer = shap.TreeExplainer(base_est)
         sv = explainer.shap_values(X_row)
 
@@ -241,8 +244,7 @@ def try_shap_explain(
     except Exception:
         return (
             False,
-            "This model/environment couldn't generate an explanation right now. "
-            "The prediction still works — explanation is optional.",
+            "Explanation couldn't be generated right now (prediction still works).",
             None,
         )
 
@@ -402,6 +404,17 @@ page = st.radio(
     label_visibility="collapsed",
 )
 
+# Persist explanation dropdown selection across reruns
+if "xai_choice" not in st.session_state:
+    st.session_state.xai_choice = "No explanation"
+
+# Cache last explanation output so it doesn't feel like it "resets"
+if "xai_df" not in st.session_state:
+    st.session_state.xai_df = None
+if "xai_msg" not in st.session_state:
+    st.session_state.xai_msg = ""
+
+
 # -----------------------------
 # Upload mode
 # -----------------------------
@@ -437,26 +450,32 @@ if page == "Upload patient file (.txt)":
                 st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
                 if missing_features:
                     with st.expander("Show missing items"):
-                        st.write([humanise_feature_name(x) for x in missing_features])
+                        clean = [humanise_feature_name(x) for x in missing_features]
+                        bullet_list(clean)
 
                 if band in ("MEDIUM", "HIGH"):
-                    st.subheader("Why this result?")
-                    choice = st.selectbox(
-                        "Explanation",
-                        ["Off", "Show key contributing factors (explainable AI)"],
-                        index=0,
+                    st.subheader("Key contributing factors (explainable AI)")
+                    st.session_state.xai_choice = st.selectbox(
+                        "Show an explanation?",
+                        ["No explanation", "Yes — show key contributing factors"],
+                        index=0 if st.session_state.xai_choice == "No explanation" else 1,
+                        key="xai_choice_select_upload",
                     )
 
-                    if choice != "Off":
-                        ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
-                        if ok and df is not None:
-                            st.caption(
-                                "These factors are what the model *used* to form the score. "
-                                "They are not proof of causality."
-                            )
-                            st.dataframe(df, use_container_width=True)
+                    if st.session_state.xai_choice != "No explanation":
+                        with st.spinner("Generating explanation..."):
+                            ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                        st.session_state.xai_msg = msg
+                        st.session_state.xai_df = df if ok else None
+
+                        st.caption(
+                            "These factors show what the model used to form the score. "
+                            "They are not proof of causality."
+                        )
+                        if st.session_state.xai_df is not None:
+                            st.dataframe(st.session_state.xai_df, use_container_width=True)
                         else:
-                            st.info(msg)
+                            st.info(st.session_state.xai_msg)
 
             except Exception as e:
                 st.error("Something went wrong while predicting from the uploaded file.")
@@ -485,6 +504,7 @@ else:
             """
         )
 
+        # Ensure ALL blood pressures are within Cardiac
         GROUPS = {
             "Respiratory & ventilation": ["RespRate", "SaO2", "FiO2", "MechVent"],
             "Cardiac": ["HR", "SysBP", "DiasBP", "MeanBP"],
@@ -533,12 +553,14 @@ else:
                             if units:
                                 help_text += f" {units}"
 
+                            step = 0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0)
+
                             inputs[var][tp_key] = cols[idx].number_input(
                                 tp_label,
                                 min_value=min_v,
                                 max_value=max_v,
                                 value=None,
-                                step=0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0),
+                                step=step,
                                 key=f"{var}_{tp_key}_num",
                                 help=help_text,
                             )
@@ -622,26 +644,32 @@ else:
                 st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
                 if missing_features:
                     with st.expander("Show missing items"):
-                        st.write([humanise_feature_name(x) for x in missing_features])
+                        clean = [humanise_feature_name(x) for x in missing_features]
+                        bullet_list(clean)
 
                 if band in ("MEDIUM", "HIGH"):
-                    st.subheader("Why this result?")
-                    choice = st.selectbox(
-                        "Explanation",
-                        ["Off", "Show key contributing factors (explainable AI)"],
-                        index=0,
+                    st.subheader("Key contributing factors (explainable AI)")
+                    st.session_state.xai_choice = st.selectbox(
+                        "Show an explanation?",
+                        ["No explanation", "Yes — show key contributing factors"],
+                        index=0 if st.session_state.xai_choice == "No explanation" else 1,
+                        key="xai_choice_select_manual",
                     )
 
-                    if choice != "Off":
-                        ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
-                        if ok and df is not None:
-                            st.caption(
-                                "These factors are what the model *used* to form the score. "
-                                "They are not proof of causality."
-                            )
-                            st.dataframe(df, use_container_width=True)
+                    if st.session_state.xai_choice != "No explanation":
+                        with st.spinner("Generating explanation..."):
+                            ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                        st.session_state.xai_msg = msg
+                        st.session_state.xai_df = df if ok else None
+
+                        st.caption(
+                            "These factors show what the model used to form the score. "
+                            "They are not proof of causality."
+                        )
+                        if st.session_state.xai_df is not None:
+                            st.dataframe(st.session_state.xai_df, use_container_width=True)
                         else:
-                            st.info(msg)
+                            st.info(st.session_state.xai_msg)
 
             except Exception as e:
                 st.error("Something went wrong while calculating risk.")
