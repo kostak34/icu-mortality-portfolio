@@ -1,10 +1,6 @@
 """
 Streamlit demo app (educational).
 
-Run locally (optional):
-  python -m pip install -r requirements.txt
-  python -m streamlit run app/app.py
-
 Notes:
 - Requires outputs/model_bundle.joblib committed in the repo for Streamlit Cloud
 - Upload mode: parse patient .txt → features → impute → predict
@@ -23,7 +19,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# SHAP is optional; we will ALWAYS show a readable fallback explanation if SHAP fails
+# SHAP is optional; we show a clinician-friendly fallback if it's unavailable/fails.
 try:
     import shap  # type: ignore
     SHAP_AVAILABLE = True
@@ -50,6 +46,12 @@ DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
 DEFAULT_LOW_THRESHOLD = 0.10
 MAX_UPLOAD_BYTES = 2_000_000  # 2MB
 
+# Gate predictions if insufficient REAL data entered/measured
+MIN_MEASURED_VARS_FOR_PREDICTION = 5  # adjust if you want stricter/looser
+
+# Explainability: show only the top N factors pushing risk upward
+TOP_K_EXPLAIN = 5
+
 TIMEPOINTS = [
     ("12 hours ago", "t12"),
     ("6 hours ago", "t6"),
@@ -58,9 +60,8 @@ TIMEPOINTS = [
 
 RISK_DOT = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
 
-
-# Clinician-friendly labels + plausible ranges.
-# If your starter_vars include names not here, they'll still work; they'll just appear under "Other".
+# Clinician-friendly metadata (optional; unknown vars still work).
+# FiO2 is fraction only (0.21–1.0) as requested.
 VAR_META: dict[str, dict[str, Any]] = {
     # Cardiac
     "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
@@ -74,18 +75,18 @@ VAR_META: dict[str, dict[str, Any]] = {
     # Respiratory & ventilation
     "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
     "SaO2": {"label": "Oxygen saturation", "units": "%", "min": 0.0, "max": 100.0, "type": "num"},
-    "FiO2": {"label": "FiO₂", "units": "fraction (0.21–1.00)", "min": 0.21, "max": 1.0, "type": "fio2_fraction"},
+    "FiO2": {"label": "FiO₂", "units": "fraction (0.21–1.00)", "min": 0.21, "max": 1.0, "type": "num"},
     "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
 
-    # Other observations
+    # Other obs
     "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
 
-    # Blood gas
+    # Blood gas (pH first)
     "pH": {"label": "pH", "units": "", "min": 6.6, "max": 7.8, "type": "num"},
     "HCO3": {"label": "Bicarbonate (HCO₃⁻)", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
     "Lactate": {"label": "Lactate", "units": "mmol/L", "min": 0.0, "max": 30.0, "type": "num"},
 
-    # Bloods / labs
+    # Bloods / labs (you asked for Na, K, Hct, Mg included)
     "Glucose": {"label": "Glucose", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
     "Creatinine": {"label": "Creatinine", "units": "µmol/L", "min": 0.0, "max": 2000.0, "type": "num"},
     "BUN": {"label": "Urea (BUN)", "units": "mmol/L", "min": 0.0, "max": 80.0, "type": "num"},
@@ -115,7 +116,6 @@ def safe_float(x: Any) -> float | None:
 
 
 def humanise_feature_name(name: str) -> str:
-    # handle engineered suffixes
     if name == "MechVent_prop_on":
         base = VAR_META.get("MechVent", {}).get("label", "Mechanical ventilation")
         return f"{base} (proportion on)"
@@ -142,7 +142,13 @@ def align_and_impute(
     feats: dict,
     feature_columns: list[str],
     imputer,
-) -> tuple[pd.DataFrame, int, list[str], pd.DataFrame]:
+) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
+    """
+    Returns:
+      X_imp: imputed dataframe for prediction
+      missing_features: model features missing pre-imputation
+      X_raw_aligned: aligned pre-imputation dataframe (NaNs where missing)
+    """
     X = pd.DataFrame([feats])
 
     for c in feature_columns:
@@ -153,15 +159,14 @@ def align_and_impute(
 
     missing_mask = X.isna().iloc[0]
     missing_features = X.columns[missing_mask].tolist()
-    present_count = int((~missing_mask).sum())
 
-    # kill pandas NAType before sklearn sees it
+    # Ensure sklearn never sees pd.NA / NAType
     X = X.replace({pd.NA: np.nan})
     X = X.where(pd.notna(X), np.nan)
     X = X.apply(pd.to_numeric, errors="coerce").astype("float64")
 
     X_imp = pd.DataFrame(imputer.transform(X), columns=feature_columns)
-    return X_imp, present_count, missing_features, X
+    return X_imp, missing_features, X
 
 
 def risk_band(prob: float, thr_low: float, thr_high: float) -> str:
@@ -177,7 +182,7 @@ def show_risk_line(band: str) -> None:
 
 
 def get_uncalibrated_estimator(model_obj: Any) -> Any:
-    # CalibratedClassifierCV has calibrated_classifiers_[i].estimator
+    # CalibratedClassifierCV typically has calibrated_classifiers_[i].estimator
     if hasattr(model_obj, "calibrated_classifiers_"):
         try:
             cc = model_obj.calibrated_classifiers_[0]
@@ -187,7 +192,6 @@ def get_uncalibrated_estimator(model_obj: Any) -> Any:
                 return cc.base_estimator
         except Exception:
             pass
-    # fallback
     if hasattr(model_obj, "estimator"):
         try:
             return model_obj.estimator
@@ -196,27 +200,25 @@ def get_uncalibrated_estimator(model_obj: Any) -> Any:
     return model_obj
 
 
-def format_push(v: float) -> str:
-    arrow = "↑" if v > 0 else ("↓" if v < 0 else "→")
-    return f"{arrow} {v:+.4f}"
-
-
-def try_shap_explain(
+def try_shap_explain_top_up_only(
     model_obj: Any,
     X_row_imp: pd.DataFrame,
     feature_columns: list[str],
-    top_k: int = 8,
+    top_k: int = 5,
 ) -> tuple[bool, pd.DataFrame | None, str]:
+    """
+    Only show factors that PUSH risk UP (positive SHAP contribution).
+    No “downranking”.
+    """
     if not SHAP_AVAILABLE:
-        return False, None, "Model explanation isn’t available on this deployment."
+        return False, None, "Explanation not available on this deployment."
 
     try:
         base_est = get_uncalibrated_estimator(model_obj)
-
-        # TreeExplainer works for RandomForest / tree ensembles
         explainer = shap.TreeExplainer(base_est)
         sv = explainer.shap_values(X_row_imp)
 
+        # Get class-1 contributions robustly
         if isinstance(sv, list):
             sv_pos = sv[1]
         else:
@@ -228,7 +230,15 @@ def try_shap_explain(
         contrib = np.asarray(sv_pos)[0].astype(float)
         vals = X_row_imp.iloc[0].to_numpy().astype(float)
 
-        order = np.argsort(np.abs(contrib))[::-1][:top_k]
+        # Keep only positive contributions (push risk up)
+        pos_idx = np.where(contrib > 0)[0]
+        if len(pos_idx) == 0:
+            return True, pd.DataFrame(
+                [{"Factor": "No strong upward drivers found", "Value used by model": np.nan, "How much it increases risk (model)": ""}]
+            ), "No positive contributions detected for this case."
+
+        # Rank by magnitude of positive contribution
+        order = pos_idx[np.argsort(contrib[pos_idx])[::-1]][:top_k]
 
         rows = []
         for i in order:
@@ -237,25 +247,24 @@ def try_shap_explain(
                 {
                     "Factor": humanise_feature_name(fname),
                     "Value used by model": float(vals[i]),
-                    "Pushes risk (↑ / ↓)": format_push(float(contrib[i])),
+                    "How much it increases risk (model)": f"+{float(contrib[i]):.4f}",
                 }
             )
 
-        df = pd.DataFrame(rows)
-        return True, df, "Model-based explanation generated."
+        return True, pd.DataFrame(rows), "Model-based explanation generated."
 
     except Exception:
-        return False, None, "Model explanation couldn't be generated here, so a clinician-friendly fallback is shown instead."
+        return False, None, "Model-based explanation couldn't be generated here."
 
 
-def fallback_explanation_from_inputs(
+def fallback_extremes_from_entered_only(
     X_raw_aligned: pd.DataFrame,
-    top_k: int = 8,
+    top_k: int = 5,
 ) -> pd.DataFrame:
     """
-    Clinician-friendly fallback: highlight the most extreme (most abnormal) values
-    based on the plausibility ranges in VAR_META.
-    Not a model explanation; it's an input sanity / “likely drivers” view.
+    Clinician-friendly fallback:
+    highlight the most extreme ENTERED/ENGINEERED values (pre-imputation).
+    Does NOT use imputed values, so it won't 'make things up' visually.
     """
     row = X_raw_aligned.iloc[0]
     items = []
@@ -264,7 +273,6 @@ def fallback_explanation_from_inputs(
         if val is None or (isinstance(val, float) and np.isnan(val)):
             continue
 
-        # only attempt to score engineered mean/last variables we know ranges for
         base = feat_name.split("_")[0] if "_" in feat_name else feat_name
         meta = VAR_META.get(base)
         if not meta or meta.get("type") == "binary":
@@ -276,7 +284,7 @@ def fallback_explanation_from_inputs(
             continue
 
         mid = (vmin + vmax) / 2.0
-        score = abs(float(val) - mid) / (vmax - vmin)  # 0=middle, 0.5=at range edges
+        score = abs(float(val) - mid) / (vmax - vmin)
         items.append((score, feat_name, float(val), vmin, vmax))
 
     items.sort(reverse=True, key=lambda x: x[0])
@@ -287,13 +295,13 @@ def fallback_explanation_from_inputs(
         rows.append(
             {
                 "Factor": humanise_feature_name(feat_name),
-                "Value used": val,
+                "Value entered/engineered": val,
                 "Why highlighted": f"Relatively extreme within plausible range ({vmin:g}–{vmax:g})",
             }
         )
 
     if not rows:
-        rows = [{"Factor": "No usable values entered", "Value used": np.nan, "Why highlighted": "Enter some values to see guidance."}]
+        rows = [{"Factor": "No entered values available", "Value entered/engineered": np.nan, "Why highlighted": "Enter some values to see guidance."}]
 
     return pd.DataFrame(rows)
 
@@ -302,6 +310,10 @@ def manual_inputs_to_engineered_features(
     inputs: dict[str, dict[str, Any]],
     starter_vars: list[str],
 ) -> dict:
+    """
+    Engineer only from values actually entered.
+    If none entered for a variable → mean/last stay NaN (blank).
+    """
     feat: dict[str, Any] = {}
 
     def latest_value(t0, t6, t12):
@@ -311,12 +323,13 @@ def manual_inputs_to_engineered_features(
         return None
 
     for var in starter_vars:
-        meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+        meta = VAR_META.get(var, {"type": "num"})
+
         v12_raw = inputs.get(var, {}).get("t12", None)
         v6_raw = inputs.get(var, {}).get("t6", None)
         v0_raw = inputs.get(var, {}).get("t0", None)
 
-        # binary vars
+        # Binary vars
         if meta.get("type") == "binary":
             def yn_to_num(x: Any) -> float | None:
                 if x == "Yes":
@@ -330,22 +343,25 @@ def manual_inputs_to_engineered_features(
             v0 = yn_to_num(v0_raw)
 
             series = [v for v in [v12, v6, v0] if v is not None]
+
+            # was_measured flag is still meaningful
             feat[f"{var}_was_measured"] = 1 if len(series) > 0 else 0
 
-            mean_val = float(np.mean(series)) if len(series) > 0 else np.nan
-            last_val = latest_value(v0, v6, v12)
-            last_val = float(last_val) if last_val is not None else np.nan
-
-            feat[f"{var}_mean"] = mean_val
-            feat[f"{var}_last"] = last_val
+            if len(series) == 0:
+                feat[f"{var}_mean"] = np.nan
+                feat[f"{var}_last"] = np.nan
+            else:
+                feat[f"{var}_mean"] = float(np.mean(series))
+                last_val = latest_value(v0, v6, v12)
+                feat[f"{var}_last"] = float(last_val) if last_val is not None else np.nan
 
             if var.lower() == "mechvent":
-                feat["MechVent_prop_on"] = mean_val if not np.isnan(mean_val) else np.nan
-                feat["MechVent_last"] = last_val if not np.isnan(last_val) else np.nan
+                feat["MechVent_prop_on"] = feat.get(f"{var}_mean", np.nan)
+                feat["MechVent_last"] = feat.get(f"{var}_last", np.nan)
 
             continue
 
-        # numeric vars
+        # Numeric vars
         v12 = safe_float(v12_raw)
         v6 = safe_float(v6_raw)
         v0 = safe_float(v0_raw)
@@ -364,30 +380,22 @@ def manual_inputs_to_engineered_features(
     return feat
 
 
-def count_variables_entered(inputs: dict[str, dict[str, Any]], starter_vars: list[str]) -> int:
+def count_measured_vars_from_engineered(feats: dict, starter_vars: list[str]) -> int:
+    """
+    Count how many clinical variables genuinely have at least one entered/measured value.
+    Uses the *_was_measured flags.
+    """
     count = 0
     for var in starter_vars:
-        meta = VAR_META.get(var, {"type": "num"})
-        vtype = meta.get("type", "num")
-
-        t12 = inputs.get(var, {}).get("t12", None)
-        t6 = inputs.get(var, {}).get("t6", None)
-        t0 = inputs.get(var, {}).get("t0", None)
-
-        if vtype == "binary":
-            provided = any(v in ("Yes", "No") for v in [t12, t6, t0])
-        else:
-            provided = any(v is not None for v in [t12, t6, t0])
-
-        if provided:
+        key = f"{var}_was_measured"
+        if key in feats and feats[key] == 1:
             count += 1
     return count
 
 
 def auto_group_vars(starter_vars: list[str]) -> dict[str, list[str]]:
     """
-    Dynamic grouping based on name patterns, so BP ALWAYS ends up under Cardiac
-    even if your dataset uses slightly different variable names.
+    Dynamic grouping using patterns, plus blood gas ordering (pH first).
     """
     groups = {
         "Respiratory & ventilation": [],
@@ -400,35 +408,47 @@ def auto_group_vars(starter_vars: list[str]) -> dict[str, list[str]]:
     for v in starter_vars:
         vl = v.lower()
 
-        # Cardiac patterns (BP + HR)
-        if any(k in vl for k in ["hr", "heart"]) and "hco3" not in vl:
-            groups["Cardiac"].append(v)
-            continue
+        # Cardiac patterns
         if any(k in vl for k in ["bp", "map", "sbp", "dbp", "sys", "dias", "meanbp"]):
             groups["Cardiac"].append(v)
             continue
+        if vl in ("hr", "heartrate") or "heart" in vl:
+            groups["Cardiac"].append(v)
+            continue
 
-        # Resp patterns
+        # Resp
         if any(k in vl for k in ["resp", "rr", "sao2", "spo2", "fio2", "mechvent", "vent"]):
             groups["Respiratory & ventilation"].append(v)
             continue
 
         # Blood gas
-        if any(k in vl for k in ["ph", "lactate", "hco3", "bicarb", "pco2", "po2", "base"]):
+        if any(k in vl for k in ["ph", "hco3", "bicarb", "lactate", "pco2", "po2", "base"]):
             groups["Blood gas"].append(v)
             continue
 
-        # Bloods / labs
+        # Bloods
         if any(k in vl for k in ["wbc", "plate", "plt", "creat", "bun", "urea", "glucose", "na", "k", "hct", "mg"]):
             groups["Bloods / labs"].append(v)
             continue
 
-        # Other
         groups["Other"].append(v)
 
-    # Keep a stable order
+    # Sort, but enforce pH first in blood gas if present
     for g in groups:
         groups[g] = sorted(groups[g])
+
+    if "Blood gas" in groups and groups["Blood gas"]:
+        bg = groups["Blood gas"]
+        # promote pH to front
+        bg_sorted = []
+        for prefer in ["pH", "ph"]:
+            for v in bg:
+                if v.lower() == prefer.lower() and v not in bg_sorted:
+                    bg_sorted.append(v)
+        for v in bg:
+            if v not in bg_sorted:
+                bg_sorted.append(v)
+        groups["Blood gas"] = bg_sorted
 
     return groups
 
@@ -502,9 +522,33 @@ if page == "Upload patient file (.txt)":
         long_df = load_patient_long(tmp_path)
         feats = summarise_patient(long_df)
 
-        X_imp, present_count, missing_features, X_raw_aligned = align_and_impute(
-            feats, feature_columns, imputer
+        # If bundle has starter_vars, we can count measured vars properly
+        measured_vars = None
+        if isinstance(starter_vars, list) and starter_vars:
+            measured_vars = count_measured_vars_from_engineered(feats, starter_vars)
+
+        # Gate prediction if insufficient measured data, unless user overrides
+        st.subheader("Data sufficiency check")
+        if measured_vars is not None:
+            st.write(f"Clinical variables measured in file: **{measured_vars}/{len(starter_vars)}**")
+        else:
+            st.write("Clinical variables measured: **unknown** (starter_vars not stored in bundle)")
+
+        predict_anyway = st.checkbox(
+            "Predict anyway (use typical defaults for missing values)",
+            value=False,
+            help="If selected, missing data will be filled with typical training values so the model can run. "
+                 "This does not represent patient-measured values."
         )
+
+        if measured_vars is not None and measured_vars < MIN_MEASURED_VARS_FOR_PREDICTION and not predict_anyway:
+            st.warning(
+                "Insufficient measured data to provide a meaningful estimate. "
+                "Enter/measure more variables, or tick 'Predict anyway' (not recommended for clinical interpretation)."
+            )
+            st.stop()
+
+        X_imp, missing_features, X_raw_aligned = align_and_impute(feats, feature_columns, imputer)
 
         prob = float(model.predict_proba(X_imp)[:, 1][0])
         band = risk_band(prob, thr_low, thr_high)
@@ -514,25 +558,24 @@ if page == "Upload patient file (.txt)":
         st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
         st.subheader("Missing data items")
-        st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
+        st.write(f"Missing items used by the model (filled with typical defaults): **{len(missing_features)}**")
         if missing_features:
             with st.expander("Show missing items"):
                 clean = [humanise_feature_name(x) for x in missing_features]
                 bullet_list(clean)
 
-        # EXPLANATION: NOT OPTIONAL for MEDIUM/HIGH, and NEVER “does nothing”
         if band in ("MEDIUM", "HIGH"):
-            st.subheader("Why this score (explainable view)")
+            st.subheader("Top factors pushing risk ↑ (model view)")
             with st.spinner("Generating explanation..."):
-                ok, df_shap, msg = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                ok, df_shap, msg = try_shap_explain_top_up_only(model, X_imp, feature_columns, top_k=TOP_K_EXPLAIN)
 
             if ok and df_shap is not None:
-                st.caption("Model-based explanation (how the model pushed the risk up/down). Not proof of causality.")
+                st.caption("Shows only factors that push the model’s risk estimate upward (not proof of causality).")
                 st.dataframe(df_shap, use_container_width=True)
             else:
                 st.caption(msg)
-                st.caption("Fallback explanation: highlights the most extreme values entered (clinician-friendly).")
-                df_fb = fallback_explanation_from_inputs(X_raw_aligned, top_k=8)
+                st.caption("Fallback: highlights the most extreme entered/engineered values (pre-imputation).")
+                df_fb = fallback_extremes_from_entered_only(X_raw_aligned, top_k=TOP_K_EXPLAIN)
                 st.dataframe(df_fb, use_container_width=True)
 
     except Exception as e:
@@ -560,15 +603,16 @@ else:
         The model uses engineered values:
         - **Average** of what you entered
         - **Most recent** value (Now → 6h → 12h)
+
+        If you enter **nothing** for a variable, it stays **blank** (missing).
         """
     )
 
-    GROUPS = auto_group_vars(starter_vars)
+    groups = auto_group_vars(starter_vars)
     inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
 
-    submitted = False
     with st.form("manual_form", clear_on_submit=False):
-        for group_name, var_list in GROUPS.items():
+        for group_name, var_list in groups.items():
             if not var_list:
                 continue
 
@@ -595,14 +639,8 @@ else:
                     else:
                         min_v = float(meta.get("min", -1e6))
                         max_v = float(meta.get("max", 1e6))
-
-                        # range warning is built into number_input via min/max
-                        help_text = f"Please enter a value between {min_v:g} and {max_v:g}"
-                        if units:
-                            help_text += f" {units}"
-
                         step = 0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0)
-
+                        help_text = f"Please enter a value between {min_v:g} and {max_v:g}" + (f" {units}" if units else "")
                         inputs[var][tp_key] = cols[idx].number_input(
                             tp_label,
                             min_value=min_v,
@@ -617,16 +655,31 @@ else:
 
             st.divider()
 
+        predict_anyway = st.checkbox(
+            "Predict anyway even if data is sparse (use typical defaults for missing values)",
+            value=False,
+            help="If selected, missing model features will be filled with typical training values so the model can run. "
+                 "This does not represent patient-measured values."
+        )
+
         submitted = st.form_submit_button("Calculate risk")
 
     if submitted:
         try:
-            entered_vars = count_variables_entered(inputs, starter_vars)
-
             raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
-            X_imp, present_count, missing_features, X_raw_aligned = align_and_impute(
-                raw_engineered, feature_columns, imputer
-            )
+            measured_vars = count_measured_vars_from_engineered(raw_engineered, starter_vars)
+
+            st.subheader("Data sufficiency check")
+            st.write(f"Clinical variables entered: **{measured_vars}/{len(starter_vars)}**")
+
+            if measured_vars < MIN_MEASURED_VARS_FOR_PREDICTION and not predict_anyway:
+                st.warning(
+                    "Insufficient data to provide a meaningful estimate. "
+                    "Enter more variables, or tick 'Predict anyway' (not recommended for clinical interpretation)."
+                )
+                st.stop()
+
+            X_imp, missing_features, X_raw_aligned = align_and_impute(raw_engineered, feature_columns, imputer)
 
             prob = float(model.predict_proba(X_imp)[:, 1][0])
             band = risk_band(prob, thr_low, thr_high)
@@ -635,35 +688,44 @@ else:
             show_risk_line(band)
             st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-            st.subheader("Data completeness")
-            st.write(f"Clinical variables entered: **{entered_vars}/{len(starter_vars)}**")
-
             st.subheader("Missing data items")
-            st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
+            st.write(f"Missing items used by the model (filled with typical defaults): **{len(missing_features)}**")
             if missing_features:
                 with st.expander("Show missing items"):
                     clean = [humanise_feature_name(x) for x in missing_features]
                     bullet_list(clean)
 
-            # EXPLANATION: NOT OPTIONAL for MEDIUM/HIGH, and NEVER “does nothing”
+            # Show engineered values (pre-imputation only, so no 'made up' medians appear)
+            with st.expander("Show engineered values used (from your inputs only)"):
+                # Show only non-missing engineered values
+                non_missing = X_raw_aligned.iloc[0].dropna()
+                if non_missing.empty:
+                    st.write("No engineered values available (nothing entered).")
+                else:
+                    df_show = non_missing.to_frame(name="Value").reset_index()
+                    df_show.columns = ["Engineered feature", "Value"]
+                    df_show["Engineered feature"] = df_show["Engineered feature"].apply(humanise_feature_name)
+                    st.dataframe(df_show, use_container_width=True)
+
             if band in ("MEDIUM", "HIGH"):
-                st.subheader("Why this score (explainable view)")
+                st.subheader("Top factors pushing risk ↑ (model view)")
                 with st.spinner("Generating explanation..."):
-                    ok, df_shap, msg = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                    ok, df_shap, msg = try_shap_explain_top_up_only(model, X_imp, feature_columns, top_k=TOP_K_EXPLAIN)
 
                 if ok and df_shap is not None:
-                    st.caption("Model-based explanation (how the model pushed the risk up/down). Not proof of causality.")
+                    st.caption("Shows only factors that push the model’s risk estimate upward (not proof of causality).")
                     st.dataframe(df_shap, use_container_width=True)
                 else:
                     st.caption(msg)
-                    st.caption("Fallback explanation: highlights the most extreme values entered (clinician-friendly).")
-                    df_fb = fallback_explanation_from_inputs(X_raw_aligned, top_k=8)
+                    st.caption("Fallback: highlights the most extreme entered/engineered values (pre-imputation).")
+                    df_fb = fallback_extremes_from_entered_only(X_raw_aligned, top_k=TOP_K_EXPLAIN)
                     st.dataframe(df_fb, use_container_width=True)
 
         except Exception as e:
             st.error("Something went wrong while calculating risk.")
             with st.expander("Technical details (for debugging)"):
                 st.exception(e)
+
 
 with st.expander("Technical details (for reviewers / developers)"):
     st.write(f"Bundle path: `{bundle_path.as_posix()}`")
