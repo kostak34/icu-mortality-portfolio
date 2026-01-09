@@ -6,7 +6,7 @@ Run locally:
   python -m streamlit run app/app.py
 
 Notes:
-- Requires a saved model bundle at outputs/model_bundle.joblib
+- Requires outputs/model_bundle.joblib committed in the repo for Streamlit Cloud
 - Upload mode: parse patient .txt → features → impute → predict
 - Manual mode: clinician enters values at 12h/6h/now → engineer mean/last → impute → predict
 - Educational demo only. Not for clinical use.
@@ -50,16 +50,16 @@ TIMEPOINTS = [
 RISK_COLOR = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
 
 # Clinician-friendly labels + units + plausible ranges
-# (Anything not in here will still work with wide numeric bounds.)
 VAR_META: dict[str, dict[str, Any]] = {
     "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
     "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
     "SysBP": {"label": "Systolic BP", "units": "mmHg", "min": 0.0, "max": 300.0, "type": "num"},
     "DiasBP": {"label": "Diastolic BP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
-    "MeanBP": {"label": "Mean arterial pressure", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
+    "MeanBP": {"label": "MAP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
     "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
     "SaO2": {"label": "Oxygen saturation", "units": "%", "min": 0.0, "max": 100.0, "type": "num"},
     "FiO2": {"label": "FiO₂", "units": "% (21–100)", "min": 21.0, "max": 100.0, "type": "fio2_percent"},
+    "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
     "pH": {"label": "pH", "units": "", "min": 6.6, "max": 7.8, "type": "num"},
     "Lactate": {"label": "Lactate", "units": "mmol/L", "min": 0.0, "max": 30.0, "type": "num"},
     "Glucose": {"label": "Glucose", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
@@ -67,7 +67,6 @@ VAR_META: dict[str, dict[str, Any]] = {
     "BUN": {"label": "Urea (BUN)", "units": "mmol/L", "min": 0.0, "max": 80.0, "type": "num"},
     "WBC": {"label": "White cell count", "units": "x10⁹/L", "min": 0.0, "max": 200.0, "type": "num"},
     "Platelets": {"label": "Platelets", "units": "x10⁹/L", "min": 0.0, "max": 2000.0, "type": "num"},
-    "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
 }
 
 
@@ -225,6 +224,50 @@ def manual_inputs_to_engineered_features(
     return feat
 
 
+def count_variables_entered(inputs: dict[str, dict[str, Any]], starter_vars: list[str]) -> int:
+    """How many variables have at least one timepoint entered (clinician actually provided something)."""
+    count = 0
+    for var in starter_vars:
+        meta = VAR_META.get(var, {"type": "num"})
+        vtype = meta.get("type", "num")
+
+        t12 = inputs.get(var, {}).get("t12", None)
+        t6 = inputs.get(var, {}).get("t6", None)
+        t0 = inputs.get(var, {}).get("t0", None)
+
+        if vtype == "binary":
+            provided = any(v in ("Yes", "No") for v in [t12, t6, t0])
+        else:
+            provided = any(v is not None for v in [t12, t6, t0])
+
+        if provided:
+            count += 1
+    return count
+
+
+def count_numeric_engineered_present(raw_engineered: dict, starter_vars: list[str]) -> tuple[int, int]:
+    """
+    Count how many engineered mean/last values are actually present (non-missing),
+    excluding *_was_measured flags which otherwise inflate "features present".
+    """
+    present = 0
+    total = 0
+    for var in starter_vars:
+        for suffix in ["_mean", "_last"]:
+            k = f"{var}{suffix}"
+            total += 1
+            v = raw_engineered.get(k, np.nan)
+            if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                present += 1
+    # Add MechVent_prop_on only if in starter_vars
+    if any(v.lower() == "mechvent" for v in starter_vars):
+        total += 1
+        v = raw_engineered.get("MechVent_prop_on", np.nan)
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            present += 1
+    return present, total
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -236,8 +279,8 @@ st.caption("Educational demo only. Not for clinical use.")
 with st.expander("What this is (and isn’t)"):
     st.write(
         """
-        This demo estimates a mortality risk from routine ICU observations and blood results.
-        It is intended as a portfolio demonstration only.
+        This demo estimates mortality risk from routine ICU observations and blood results.
+        It’s designed to show how a decision-support tool *could* work in principle.
 
         It has **not** been validated for real-world clinical use and must not be used for patient care.
         """
@@ -266,12 +309,22 @@ c3.metric("HIGH risk", f"≥ {thr_high:.3f}")
 
 st.divider()
 
-tab_upload, tab_manual = st.tabs(["Upload patient file (.txt)", "Manual entry"])
+# --- Page selector that *stays* on the current page after reruns ---
+if "page" not in st.session_state:
+    st.session_state.page = "Upload patient file (.txt)"
+
+page = st.radio(
+    "Mode",
+    ["Upload patient file (.txt)", "Manual entry"],
+    key="page",
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
 # -----------------------------
 # Upload mode
 # -----------------------------
-with tab_upload:
+if page == "Upload patient file (.txt)":
     uploaded = st.file_uploader("Upload a single patient .txt file", type=["txt"])
 
     if uploaded is None:
@@ -298,10 +351,10 @@ with tab_upload:
                 st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
                 st.subheader("Data completeness")
-                st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-                st.write(f"Missing features (imputed): **{len(missing_features)}**")
+                st.write(f"Model features present: **{present_count}/{len(feature_columns)}**")
+                st.write(f"Missing model features (imputed): **{len(missing_features)}**")
                 if missing_features:
-                    with st.expander("Show missing features"):
+                    with st.expander("Show missing model features"):
                         st.write(missing_features)
 
             except Exception:
@@ -316,67 +369,127 @@ with tab_upload:
 # -----------------------------
 # Manual mode
 # -----------------------------
-with tab_manual:
+else:
     if starter_vars is None or not isinstance(starter_vars, list) or len(starter_vars) == 0:
         st.warning("Manual entry is unavailable because this model bundle does not include `starter_vars`.")
     else:
         st.write(
             """
             Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
-            The model uses these to create the same kinds of features it was trained on (mean + most recent value).
+            The tool will convert these into the same type of inputs the model was trained on
+            (average + most recent value).
             """
         )
+
+        # Group variables (only show those actually used by the bundle)
+        GROUPS = {
+            "Respiratory & ventilation": ["RespRate", "SaO2", "FiO2", "MechVent"],
+            "Haemodynamics": ["HR", "SysBP", "DiasBP", "MeanBP", "Temp"],
+            "Blood gas / perfusion": ["pH", "Lactate"],
+            "Bloods / labs": ["Glucose", "Creatinine", "BUN", "WBC", "Platelets"],
+        }
+
+        # Preserve any other starter_vars not listed above
+        listed = {v for g in GROUPS.values() for v in g}
+        extras = [v for v in starter_vars if v not in listed]
 
         inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
 
         submitted = False
         with st.form("manual_form", clear_on_submit=False):
-            for var in starter_vars:
-                meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
-                label = meta.get("label", var)
-                units = meta.get("units", "")
-                vtype = meta.get("type", "num")
+            for group_name, var_list in GROUPS.items():
+                vars_in_group = [v for v in var_list if v in starter_vars]
+                if not vars_in_group:
+                    continue
 
-                st.markdown(f"### {label}" + (f" ({units})" if units else ""))
+                st.markdown(f"## {group_name}")
 
-                cols = st.columns(3)
-                for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
-                    if vtype == "binary":
-                        inputs[var][tp_key] = cols[idx].selectbox(
-                            tp_label,
-                            options=["Missing", "Yes", "No"],
-                            index=0,
-                            key=f"{var}_{tp_key}_bin",
-                            help="Choose Yes / No. Leave as Missing if unknown.",
-                        )
-                    else:
-                        min_v = float(meta.get("min", -1e6))
-                        max_v = float(meta.get("max", 1e6))
-                        help_text = f"Enter a number. Expected range: {min_v:g}–{max_v:g}."
-                        if units:
-                            help_text += f" Units: {units}."
-                        if vtype == "fio2_percent":
-                            help_text = "Enter FiO₂ as a percentage (21–100)."
+                for var in vars_in_group:
+                    meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+                    label = meta.get("label", var)
+                    units = meta.get("units", "")
+                    vtype = meta.get("type", "num")
 
-                        inputs[var][tp_key] = cols[idx].number_input(
-                            tp_label,
-                            min_value=min_v,
-                            max_value=max_v,
-                            value=None,
-                            step=1.0 if (max_v - min_v) > 50 else 0.1,
-                            key=f"{var}_{tp_key}_num",
-                            help=help_text,
-                            format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
-                        )
+                    st.markdown(f"**{label}**" + (f" ({units})" if units else ""))
+
+                    cols = st.columns(3)
+                    for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
+                        if vtype == "binary":
+                            inputs[var][tp_key] = cols[idx].selectbox(
+                                tp_label,
+                                options=["Missing", "Yes", "No"],
+                                index=0,
+                                key=f"{var}_{tp_key}_bin",
+                                help="Choose Yes / No. Leave as Missing if unknown.",
+                            )
+                        else:
+                            min_v = float(meta.get("min", -1e6))
+                            max_v = float(meta.get("max", 1e6))
+
+                            if vtype == "fio2_percent":
+                                help_text = "Enter FiO₂ as a percentage (21–100)."
+                            else:
+                                help_text = f"Expected range: {min_v:g}–{max_v:g}" + (f" {units}" if units else "")
+
+                            inputs[var][tp_key] = cols[idx].number_input(
+                                tp_label,
+                                min_value=min_v,
+                                max_value=max_v,
+                                value=None,
+                                step=1.0 if (max_v - min_v) > 50 else 0.1,
+                                key=f"{var}_{tp_key}_num",
+                                help=help_text,
+                                format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
+                            )
+
+                    st.write("")  # small spacing
+
+                st.divider()
+
+            if extras:
+                st.markdown("## Other variables")
+                for var in extras:
+                    meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+                    label = meta.get("label", var)
+                    units = meta.get("units", "")
+                    vtype = meta.get("type", "num")
+
+                    st.markdown(f"**{label}**" + (f" ({units})" if units else ""))
+
+                    cols = st.columns(3)
+                    for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
+                        if vtype == "binary":
+                            inputs[var][tp_key] = cols[idx].selectbox(
+                                tp_label,
+                                options=["Missing", "Yes", "No"],
+                                index=0,
+                                key=f"{var}_{tp_key}_bin_extra",
+                            )
+                        else:
+                            min_v = float(meta.get("min", -1e6))
+                            max_v = float(meta.get("max", 1e6))
+                            inputs[var][tp_key] = cols[idx].number_input(
+                                tp_label,
+                                min_value=min_v,
+                                max_value=max_v,
+                                value=None,
+                                step=1.0 if (max_v - min_v) > 50 else 0.1,
+                                key=f"{var}_{tp_key}_num_extra",
+                            )
+
+                    st.write("")
 
                 st.divider()
 
             submitted = st.form_submit_button("Calculate risk")
 
-        # No st.stop() here — we just don't show results until submitted
         if submitted:
             try:
+                entered_vars = count_variables_entered(inputs, starter_vars)
+
                 raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
+                numeric_present, numeric_total = count_numeric_engineered_present(raw_engineered, starter_vars)
+
                 X_imp, present_count, missing_features, _ = align_and_impute(raw_engineered, feature_columns, imputer)
 
                 prob = float(model.predict_proba(X_imp)[:, 1][0])
@@ -386,17 +499,28 @@ with tab_manual:
                 band_strip(band)
                 st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-                st.subheader("Data completeness")
-                st.write(f"Features present: **{present_count}/{len(feature_columns)}**")
-                st.write(f"Missing features (imputed): **{len(missing_features)}**")
-                if missing_features:
-                    with st.expander("Show missing features"):
+                st.subheader("What was actually entered")
+                c1, c2 = st.columns(2)
+                c1.metric("Variables entered", f"{entered_vars}/{len(starter_vars)}")
+                c2.metric("Engineered numeric values present", f"{numeric_present}/{numeric_total}")
+
+                with st.expander("More detail (model completeness)"):
+                    st.write(
+                        """
+                        The model expects many features, including internal flags like `*_was_measured`.
+                        Those flags are always populated (0 or 1), which can make the “features present”
+                        number look high even if you only entered a few clinical values.
+                        """
+                    )
+                    st.write(f"Model features present: **{present_count}/{len(feature_columns)}**")
+                    st.write(f"Missing model features (imputed): **{len(missing_features)}**")
+                    if missing_features:
+                        st.write("Missing model features (imputed):")
                         st.write(missing_features)
 
             except Exception:
                 st.error("Something went wrong while predicting from manual entry.")
                 st.info("Please check entries and try again.")
-
 
 # -----------------------------
 # Technical details (bottom)
