@@ -1,7 +1,7 @@
 """
 Streamlit demo app (educational).
 
-Run locally:
+Run locally (optional):
   python -m pip install -r requirements.txt
   python -m streamlit run app/app.py
 
@@ -22,6 +22,15 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Optional explainability
+try:
+    import shap  # type: ignore
+    SHAP_AVAILABLE = True
+except Exception:
+    shap = None
+    SHAP_AVAILABLE = False
+
 
 # -----------------------------
 # Path setup (robust imports)
@@ -47,26 +56,40 @@ TIMEPOINTS = [
     ("Now", "t0"),
 ]
 
-RISK_COLOR = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
+RISK_DOT = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
 
 # Clinician-friendly labels + units + plausible ranges
 VAR_META: dict[str, dict[str, Any]] = {
+    # Cardiac
     "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
-    "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
     "SysBP": {"label": "Systolic BP", "units": "mmHg", "min": 0.0, "max": 300.0, "type": "num"},
     "DiasBP": {"label": "Diastolic BP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
     "MeanBP": {"label": "MAP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
-    "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
+
+    # Respiratory & ventilation
+    "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
     "SaO2": {"label": "Oxygen saturation", "units": "%", "min": 0.0, "max": 100.0, "type": "num"},
-    "FiO2": {"label": "FiO₂", "units": "% (21–100)", "min": 21.0, "max": 100.0, "type": "fio2_percent"},
+    "FiO2": {"label": "FiO₂", "units": "fraction (0.21–1.00)", "min": 0.21, "max": 1.0, "type": "fio2_fraction"},
     "MechVent": {"label": "Invasive mechanical ventilation", "units": "Yes/No", "type": "binary"},
+
+    # Other observations
+    "Temp": {"label": "Temperature", "units": "°C", "min": 25.0, "max": 45.0, "type": "num"},
+
+    # Blood gas
     "pH": {"label": "pH", "units": "", "min": 6.6, "max": 7.8, "type": "num"},
+    "HCO3": {"label": "Bicarbonate (HCO₃⁻)", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
     "Lactate": {"label": "Lactate", "units": "mmol/L", "min": 0.0, "max": 30.0, "type": "num"},
+
+    # Bloods / labs
     "Glucose": {"label": "Glucose", "units": "mmol/L", "min": 0.0, "max": 60.0, "type": "num"},
     "Creatinine": {"label": "Creatinine", "units": "µmol/L", "min": 0.0, "max": 2000.0, "type": "num"},
     "BUN": {"label": "Urea (BUN)", "units": "mmol/L", "min": 0.0, "max": 80.0, "type": "num"},
     "WBC": {"label": "White cell count", "units": "x10⁹/L", "min": 0.0, "max": 200.0, "type": "num"},
     "Platelets": {"label": "Platelets", "units": "x10⁹/L", "min": 0.0, "max": 2000.0, "type": "num"},
+    "Na": {"label": "Sodium (Na⁺)", "units": "mmol/L", "min": 80.0, "max": 200.0, "type": "num"},
+    "K": {"label": "Potassium (K⁺)", "units": "mmol/L", "min": 1.0, "max": 10.0, "type": "num"},
+    "Hct": {"label": "Haematocrit (Hct)", "units": "fraction (0–1)", "min": 0.0, "max": 1.0, "type": "num"},
+    "Mg": {"label": "Magnesium (Mg²⁺)", "units": "mmol/L", "min": 0.0, "max": 5.0, "type": "num"},
 }
 
 
@@ -87,32 +110,22 @@ def safe_float(x: Any) -> float | None:
 
 
 def humanise_feature_name(name: str) -> str:
-    """
-    Convert model feature names like `RespRate_mean` into clinician-friendly labels.
-    Falls back gracefully if the variable isn't in VAR_META.
-    """
-    # Special case
     if name == "MechVent_prop_on":
         base = VAR_META.get("MechVent", {}).get("label", "Mechanical ventilation")
         return f"{base} (proportion on)"
 
-    # Pattern: <Var>_<suffix>
     if "_" in name:
         base, suffix = name.split("_", 1)
         base_label = VAR_META.get(base, {}).get("label", base)
         suffix_map = {
-            "mean": "mean",
+            "mean": "average",
             "last": "most recent",
-            "was": None,  # handled below if ever seen
+            "was_measured": "recorded (yes/no)",
         }
-        if suffix == "was_measured":
-            return f"{base_label} (recorded: yes/no)"
-        if suffix in suffix_map and suffix_map[suffix] is not None:
+        if suffix in suffix_map:
             return f"{base_label} ({suffix_map[suffix]})"
-        # Unknown suffix
         return f"{base_label} ({suffix.replace('_', ' ')})"
 
-    # No underscore
     return VAR_META.get(name, {}).get("label", name)
 
 
@@ -133,6 +146,7 @@ def align_and_impute(
     missing_features = X.columns[missing_mask].tolist()
     present_count = int((~missing_mask).sum())
 
+    # Prevent pandas NAType leaking into sklearn
     X = X.replace({pd.NA: np.nan})
     X = X.where(pd.notna(X), np.nan)
     X = X.apply(pd.to_numeric, errors="coerce").astype("float64")
@@ -149,20 +163,88 @@ def risk_band(prob: float, thr_low: float, thr_high: float) -> str:
     return "HIGH"
 
 
-def show_risk_banner(band: str) -> None:
-    icon = RISK_COLOR[band]
-    if band == "LOW":
-        st.success(f"{icon} **LOW RISK**")
-    elif band == "MEDIUM":
-        st.warning(f"{icon} **MEDIUM RISK**")
-    else:
-        st.error(f"{icon} **HIGH RISK**")
+def show_risk_line(band: str) -> None:
+    st.markdown(f"### {RISK_DOT[band]} **{band} RISK**")
 
 
-def normalise_fio2_percent_to_fraction(v: float | None) -> float | None:
-    if v is None:
-        return None
-    return float(v) / 100.0
+def get_uncalibrated_estimator(model_obj: Any) -> Any:
+    if hasattr(model_obj, "calibrated_classifiers_"):
+        try:
+            cc = model_obj.calibrated_classifiers_[0]
+            if hasattr(cc, "estimator"):
+                return cc.estimator
+            if hasattr(cc, "base_estimator"):
+                return cc.base_estimator
+        except Exception:
+            pass
+
+    if hasattr(model_obj, "estimator"):
+        try:
+            return model_obj.estimator
+        except Exception:
+            pass
+
+    return model_obj
+
+
+def format_push(v: float) -> str:
+    """
+    Convert SHAP contributions into clinician-friendly 'push' text.
+    Positive -> pushes risk up; negative -> pushes risk down.
+    """
+    arrow = "↑" if v > 0 else ("↓" if v < 0 else "→")
+    return f"{arrow} {v:+.4f}"
+
+
+def try_shap_explain(
+    model_obj: Any,
+    X_row: pd.DataFrame,
+    feature_columns: list[str],
+    top_k: int = 8,
+) -> tuple[bool, str, pd.DataFrame | None]:
+    if not SHAP_AVAILABLE:
+        return False, "Explainability isn't available in this environment (SHAP not installed).", None
+
+    try:
+        base_est = get_uncalibrated_estimator(model_obj)
+
+        explainer = shap.TreeExplainer(base_est)
+        sv = explainer.shap_values(X_row)
+
+        if isinstance(sv, list):
+            sv_pos = sv[1]
+        else:
+            if getattr(sv, "ndim", 0) == 3:
+                sv_pos = sv[:, :, 1]
+            else:
+                sv_pos = sv
+
+        contrib = np.asarray(sv_pos)[0].astype(float)
+        vals = X_row.iloc[0].to_numpy().astype(float)
+
+        order = np.argsort(np.abs(contrib))[::-1][:top_k]
+
+        rows = []
+        for i in order:
+            fname = feature_columns[i]
+            rows.append(
+                {
+                    "Factor": humanise_feature_name(fname),
+                    "Value used by model": float(vals[i]),
+                    "Pushes risk (↑ / ↓)": format_push(float(contrib[i])),
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        return True, "Explanation generated.", df
+
+    except Exception:
+        return (
+            False,
+            "This model/environment couldn't generate an explanation right now. "
+            "The prediction still works — explanation is optional.",
+            None,
+        )
 
 
 def manual_inputs_to_engineered_features(
@@ -215,11 +297,6 @@ def manual_inputs_to_engineered_features(
         v6 = safe_float(v6_raw)
         v0 = safe_float(v0_raw)
 
-        if meta.get("type") == "fio2_percent":
-            v12 = normalise_fio2_percent_to_fraction(v12)
-            v6 = normalise_fio2_percent_to_fraction(v6)
-            v0 = normalise_fio2_percent_to_fraction(v0)
-
         series = [v for v in [v12, v6, v0] if v is not None]
         feat[f"{var}_was_measured"] = 1 if len(series) > 0 else 0
 
@@ -254,7 +331,7 @@ def count_variables_entered(inputs: dict[str, dict[str, Any]], starter_vars: lis
     return count
 
 
-def count_numeric_engineered_present(raw_engineered: dict, starter_vars: list[str]) -> tuple[int, int]:
+def count_engineered_items_available(raw_engineered: dict, starter_vars: list[str]) -> tuple[int, int]:
     present = 0
     total = 0
     for var in starter_vars:
@@ -264,11 +341,13 @@ def count_numeric_engineered_present(raw_engineered: dict, starter_vars: list[st
             v = raw_engineered.get(k, np.nan)
             if v is not None and not (isinstance(v, float) and np.isnan(v)):
                 present += 1
+
     if any(v.lower() == "mechvent" for v in starter_vars):
         total += 1
         v = raw_engineered.get("MechVent_prop_on", np.nan)
         if v is not None and not (isinstance(v, float) and np.isnan(v)):
             present += 1
+
     return present, total
 
 
@@ -283,9 +362,9 @@ st.caption("Educational demo only. Not for clinical use.")
 with st.expander("What this is (and isn’t)"):
     st.write(
         """
-        This demo estimates mortality risk from routine ICU observations and blood results.
-        It’s designed to show how a decision-support tool *could* work in principle.
+        This demo estimates ICU mortality risk using a small set of routine observations and blood results.
 
+        It’s a **portfolio demonstration** of how clinical decision-support software could work.
         It has **not** been validated for real-world clinical use and must not be used for patient care.
         """
     )
@@ -343,24 +422,46 @@ if page == "Upload patient file (.txt)":
                 long_df = load_patient_long(tmp_path)
                 feats = summarise_patient(long_df)
 
-                X_imp, present_count, missing_features, _ = align_and_impute(feats, feature_columns, imputer)
+                X_imp, present_count, missing_features, X_aligned = align_and_impute(
+                    feats, feature_columns, imputer
+                )
 
                 prob = float(model.predict_proba(X_imp)[:, 1][0])
                 band = risk_band(prob, thr_low, thr_high)
 
                 st.subheader("Result")
-                show_risk_banner(band)
+                show_risk_line(band)
                 st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-                st.subheader("Data completeness")
-                st.write(f"Model features missing (imputed): **{len(missing_features)}**")
+                st.subheader("Missing data items")
+                st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
                 if missing_features:
-                    with st.expander("Show missing data items"):
+                    with st.expander("Show missing items"):
                         st.write([humanise_feature_name(x) for x in missing_features])
 
-            except Exception:
+                if band in ("MEDIUM", "HIGH"):
+                    st.subheader("Why this result?")
+                    choice = st.selectbox(
+                        "Explanation",
+                        ["Off", "Show key contributing factors (explainable AI)"],
+                        index=0,
+                    )
+
+                    if choice != "Off":
+                        ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                        if ok and df is not None:
+                            st.caption(
+                                "These factors are what the model *used* to form the score. "
+                                "They are not proof of causality."
+                            )
+                            st.dataframe(df, use_container_width=True)
+                        else:
+                            st.info(msg)
+
+            except Exception as e:
                 st.error("Something went wrong while predicting from the uploaded file.")
-                st.info("Tip: try a different patient file. This demo expects the same format used during training.")
+                with st.expander("Technical details (for debugging)"):
+                    st.exception(e)
             finally:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -377,15 +478,19 @@ else:
         st.write(
             """
             Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
-            The tool converts these into the model inputs (average + most recent value).
+
+            The model uses engineered values:
+            - **Average** of the values you entered
+            - **Most recent** value (Now → 6h → 12h)
             """
         )
 
         GROUPS = {
             "Respiratory & ventilation": ["RespRate", "SaO2", "FiO2", "MechVent"],
-            "Haemodynamics": ["HR", "SysBP", "DiasBP", "MeanBP", "Temp"],
-            "Blood gas / perfusion": ["pH", "Lactate"],
-            "Bloods / labs": ["Glucose", "Creatinine", "BUN", "WBC", "Platelets"],
+            "Cardiac": ["HR", "SysBP", "DiasBP", "MeanBP"],
+            "Blood gas": ["pH", "HCO3", "Lactate"],
+            "Bloods / labs": ["Glucose", "Creatinine", "BUN", "WBC", "Platelets", "Na", "K", "Hct", "Mg"],
+            "Other": ["Temp"],
         }
 
         listed = {v for g in GROUPS.values() for v in g}
@@ -423,21 +528,19 @@ else:
                         else:
                             min_v = float(meta.get("min", -1e6))
                             max_v = float(meta.get("max", 1e6))
-                            help_text = (
-                                "Enter FiO₂ as a percentage (21–100)."
-                                if vtype == "fio2_percent"
-                                else f"Expected range: {min_v:g}–{max_v:g}" + (f" {units}" if units else "")
-                            )
+
+                            help_text = f"Please enter a value between {min_v:g} and {max_v:g}"
+                            if units:
+                                help_text += f" {units}"
 
                             inputs[var][tp_key] = cols[idx].number_input(
                                 tp_label,
                                 min_value=min_v,
                                 max_value=max_v,
                                 value=None,
-                                step=1.0 if (max_v - min_v) > 50 else 0.1,
+                                step=0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0),
                                 key=f"{var}_{tp_key}_num",
                                 help=help_text,
-                                format="%.3f" if (max_v - min_v) <= 20 else "%.1f",
                             )
 
                     st.write("")
@@ -445,7 +548,7 @@ else:
                 st.divider()
 
             if extras:
-                st.markdown("## Other variables")
+                st.markdown("## Other variables (used by this model)")
                 for var in extras:
                     meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
                     label = meta.get("label", var)
@@ -470,11 +573,10 @@ else:
                                 min_value=min_v,
                                 max_value=max_v,
                                 value=None,
-                                step=1.0 if (max_v - min_v) > 50 else 0.1,
+                                step=0.1,
                                 key=f"{var}_{tp_key}_num_extra",
                             )
                     st.write("")
-
                 st.divider()
 
             submitted = st.form_submit_button("Calculate risk")
@@ -484,21 +586,37 @@ else:
                 entered_vars = count_variables_entered(inputs, starter_vars)
 
                 raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
-                numeric_present, numeric_total = count_numeric_engineered_present(raw_engineered, starter_vars)
+                eng_present, eng_total = count_engineered_items_available(raw_engineered, starter_vars)
 
-                X_imp, _present_count, missing_features, _ = align_and_impute(raw_engineered, feature_columns, imputer)
+                X_imp, _present_count, missing_features, _X_aligned = align_and_impute(
+                    raw_engineered, feature_columns, imputer
+                )
 
                 prob = float(model.predict_proba(X_imp)[:, 1][0])
                 band = risk_band(prob, thr_low, thr_high)
 
                 st.subheader("Result")
-                show_risk_banner(band)
+                show_risk_line(band)
                 st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-                st.subheader("What was actually entered")
-                c1, c2 = st.columns(2)
-                c1.metric("Variables entered", f"{entered_vars}/{len(starter_vars)}")
-                c2.metric("Engineered values available", f"{numeric_present}/{numeric_total}")
+                st.subheader("What the model actually used")
+                st.write(
+                    f"- Clinical variables entered: **{entered_vars}/{len(starter_vars)}**\n"
+                    f"- Engineered values created (average + most recent): **{eng_present}/{eng_total}**"
+                )
+
+                with st.expander("What does “engineered values” mean?"):
+                    st.write(
+                        """
+                        The model doesn’t take raw “12h/6h/now” directly.
+                        For each variable it creates:
+                        - **Average** = average of the values you entered
+                        - **Most recent** = the latest value available (Now → 6h → 12h)
+
+                        For ventilation:
+                        - **MechVent** is treated as Yes=1 / No=0, and the average becomes a rough “proportion on”.
+                        """
+                    )
 
                 st.subheader("Missing data items")
                 st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
@@ -506,14 +624,32 @@ else:
                     with st.expander("Show missing items"):
                         st.write([humanise_feature_name(x) for x in missing_features])
 
-            except Exception:
-                st.error("Something went wrong while predicting from manual entry.")
-                st.info("Please check entries and try again.")
+                if band in ("MEDIUM", "HIGH"):
+                    st.subheader("Why this result?")
+                    choice = st.selectbox(
+                        "Explanation",
+                        ["Off", "Show key contributing factors (explainable AI)"],
+                        index=0,
+                    )
 
-# -----------------------------
-# Technical details (bottom)
-# -----------------------------
+                    if choice != "Off":
+                        ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+                        if ok and df is not None:
+                            st.caption(
+                                "These factors are what the model *used* to form the score. "
+                                "They are not proof of causality."
+                            )
+                            st.dataframe(df, use_container_width=True)
+                        else:
+                            st.info(msg)
+
+            except Exception as e:
+                st.error("Something went wrong while calculating risk.")
+                with st.expander("Technical details (for debugging)"):
+                    st.exception(e)
+
 with st.expander("Technical details (for reviewers / developers)"):
     st.write(f"Bundle path: `{bundle_path.as_posix()}`")
     st.write(f"Features expected: {len(feature_columns)}")
     st.write(f"Starter vars in bundle: {len(starter_vars) if isinstance(starter_vars, list) else 'missing'}")
+    st.write(f"Explainable AI available: {SHAP_AVAILABLE}")
