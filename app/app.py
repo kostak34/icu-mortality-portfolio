@@ -544,7 +544,7 @@ if page == "Upload patient file (.txt)":
         if measured_vars is not None and measured_vars < MIN_MEASURED_VARS_FOR_PREDICTION and not predict_anyway:
             st.warning(
                 "Insufficient measured data to provide a meaningful estimate. "
-                "Enter/measure more variables, or tick 'Predict anyway' (not recommended for clinical interpretation)."
+                "Measure more variables, or tick 'Predict anyway' (not recommended for clinical interpretation)."
             )
             st.stop()
 
@@ -564,6 +564,7 @@ if page == "Upload patient file (.txt)":
                 clean = [humanise_feature_name(x) for x in missing_features]
                 bullet_list(clean)
 
+        # ✅ ADDITION (only change): Same explainable AI block as manual entry
         if band in ("MEDIUM", "HIGH"):
             st.subheader("Top factors pushing risk ↑ (model view)")
             with st.spinner("Generating explanation..."):
@@ -577,6 +578,7 @@ if page == "Upload patient file (.txt)":
                 st.caption("Fallback: highlights the most extreme entered/engineered values (pre-imputation).")
                 df_fb = fallback_extremes_from_entered_only(X_raw_aligned, top_k=TOP_K_EXPLAIN)
                 st.dataframe(df_fb, use_container_width=True)
+        # ✅ END ADDITION
 
     except Exception as e:
         st.error("Something went wrong while predicting from the uploaded file.")
