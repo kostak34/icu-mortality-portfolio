@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional explainability
+# SHAP is optional; we will ALWAYS show a readable fallback explanation if SHAP fails
 try:
     import shap  # type: ignore
     SHAP_AVAILABLE = True
@@ -44,7 +44,7 @@ from scripts.step_02_batch_features import summarise_patient  # type: ignore
 
 
 # -----------------------------
-# Constants / helpers
+# Constants / configuration
 # -----------------------------
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
 DEFAULT_LOW_THRESHOLD = 0.10
@@ -58,13 +58,18 @@ TIMEPOINTS = [
 
 RISK_DOT = {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}
 
-# Clinician-friendly labels + units + plausible ranges
+
+# Clinician-friendly labels + plausible ranges.
+# If your starter_vars include names not here, they'll still work; they'll just appear under "Other".
 VAR_META: dict[str, dict[str, Any]] = {
     # Cardiac
     "HR": {"label": "Heart rate", "units": "bpm", "min": 0.0, "max": 250.0, "type": "num"},
-    "SysBP": {"label": "Systolic BP", "units": "mmHg", "min": 0.0, "max": 300.0, "type": "num"},
-    "DiasBP": {"label": "Diastolic BP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
-    "MeanBP": {"label": "MAP", "units": "mmHg", "min": 0.0, "max": 200.0, "type": "num"},
+    "SysBP": {"label": "Systolic BP", "units": "mmHg", "min": 40.0, "max": 300.0, "type": "num"},
+    "DiasBP": {"label": "Diastolic BP", "units": "mmHg", "min": 20.0, "max": 200.0, "type": "num"},
+    "MeanBP": {"label": "MAP", "units": "mmHg", "min": 30.0, "max": 200.0, "type": "num"},
+    "MAP": {"label": "MAP", "units": "mmHg", "min": 30.0, "max": 200.0, "type": "num"},
+    "SBP": {"label": "Systolic BP", "units": "mmHg", "min": 40.0, "max": 300.0, "type": "num"},
+    "DBP": {"label": "Diastolic BP", "units": "mmHg", "min": 20.0, "max": 200.0, "type": "num"},
 
     # Respiratory & ventilation
     "RespRate": {"label": "Respiratory rate", "units": "breaths/min", "min": 0.0, "max": 80.0, "type": "num"},
@@ -110,6 +115,7 @@ def safe_float(x: Any) -> float | None:
 
 
 def humanise_feature_name(name: str) -> str:
+    # handle engineered suffixes
     if name == "MechVent_prop_on":
         base = VAR_META.get("MechVent", {}).get("label", "Mechanical ventilation")
         return f"{base} (proportion on)"
@@ -117,11 +123,7 @@ def humanise_feature_name(name: str) -> str:
     if "_" in name:
         base, suffix = name.split("_", 1)
         base_label = VAR_META.get(base, {}).get("label", base)
-        suffix_map = {
-            "mean": "average",
-            "last": "most recent",
-            "was_measured": "recorded (yes/no)",
-        }
+        suffix_map = {"mean": "average", "last": "most recent", "was_measured": "recorded"}
         if suffix in suffix_map:
             return f"{base_label} ({suffix_map[suffix]})"
         return f"{base_label} ({suffix.replace('_', ' ')})"
@@ -130,7 +132,6 @@ def humanise_feature_name(name: str) -> str:
 
 
 def bullet_list(items: list[str]) -> None:
-    """Render a clean clinician-friendly list (no brackets/quotes)."""
     if not items:
         st.write("None.")
         return
@@ -154,7 +155,7 @@ def align_and_impute(
     missing_features = X.columns[missing_mask].tolist()
     present_count = int((~missing_mask).sum())
 
-    # Prevent pandas NAType leaking into sklearn
+    # kill pandas NAType before sklearn sees it
     X = X.replace({pd.NA: np.nan})
     X = X.where(pd.notna(X), np.nan)
     X = X.apply(pd.to_numeric, errors="coerce").astype("float64")
@@ -176,6 +177,7 @@ def show_risk_line(band: str) -> None:
 
 
 def get_uncalibrated_estimator(model_obj: Any) -> Any:
+    # CalibratedClassifierCV has calibrated_classifiers_[i].estimator
     if hasattr(model_obj, "calibrated_classifiers_"):
         try:
             cc = model_obj.calibrated_classifiers_[0]
@@ -185,13 +187,12 @@ def get_uncalibrated_estimator(model_obj: Any) -> Any:
                 return cc.base_estimator
         except Exception:
             pass
-
+    # fallback
     if hasattr(model_obj, "estimator"):
         try:
             return model_obj.estimator
         except Exception:
             pass
-
     return model_obj
 
 
@@ -202,17 +203,19 @@ def format_push(v: float) -> str:
 
 def try_shap_explain(
     model_obj: Any,
-    X_row: pd.DataFrame,
+    X_row_imp: pd.DataFrame,
     feature_columns: list[str],
     top_k: int = 8,
-) -> tuple[bool, str, pd.DataFrame | None]:
+) -> tuple[bool, pd.DataFrame | None, str]:
     if not SHAP_AVAILABLE:
-        return False, "Explainable AI isn't available here (SHAP isn't installed).", None
+        return False, None, "Model explanation isn’t available on this deployment."
 
     try:
         base_est = get_uncalibrated_estimator(model_obj)
+
+        # TreeExplainer works for RandomForest / tree ensembles
         explainer = shap.TreeExplainer(base_est)
-        sv = explainer.shap_values(X_row)
+        sv = explainer.shap_values(X_row_imp)
 
         if isinstance(sv, list):
             sv_pos = sv[1]
@@ -223,7 +226,7 @@ def try_shap_explain(
                 sv_pos = sv
 
         contrib = np.asarray(sv_pos)[0].astype(float)
-        vals = X_row.iloc[0].to_numpy().astype(float)
+        vals = X_row_imp.iloc[0].to_numpy().astype(float)
 
         order = np.argsort(np.abs(contrib))[::-1][:top_k]
 
@@ -239,14 +242,60 @@ def try_shap_explain(
             )
 
         df = pd.DataFrame(rows)
-        return True, "Explanation generated.", df
+        return True, df, "Model-based explanation generated."
 
     except Exception:
-        return (
-            False,
-            "Explanation couldn't be generated right now (prediction still works).",
-            None,
+        return False, None, "Model explanation couldn't be generated here, so a clinician-friendly fallback is shown instead."
+
+
+def fallback_explanation_from_inputs(
+    X_raw_aligned: pd.DataFrame,
+    top_k: int = 8,
+) -> pd.DataFrame:
+    """
+    Clinician-friendly fallback: highlight the most extreme (most abnormal) values
+    based on the plausibility ranges in VAR_META.
+    Not a model explanation; it's an input sanity / “likely drivers” view.
+    """
+    row = X_raw_aligned.iloc[0]
+    items = []
+
+    for feat_name, val in row.items():
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+
+        # only attempt to score engineered mean/last variables we know ranges for
+        base = feat_name.split("_")[0] if "_" in feat_name else feat_name
+        meta = VAR_META.get(base)
+        if not meta or meta.get("type") == "binary":
+            continue
+
+        vmin = float(meta.get("min", -np.inf))
+        vmax = float(meta.get("max", np.inf))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            continue
+
+        mid = (vmin + vmax) / 2.0
+        score = abs(float(val) - mid) / (vmax - vmin)  # 0=middle, 0.5=at range edges
+        items.append((score, feat_name, float(val), vmin, vmax))
+
+    items.sort(reverse=True, key=lambda x: x[0])
+    items = items[:top_k]
+
+    rows = []
+    for score, feat_name, val, vmin, vmax in items:
+        rows.append(
+            {
+                "Factor": humanise_feature_name(feat_name),
+                "Value used": val,
+                "Why highlighted": f"Relatively extreme within plausible range ({vmin:g}–{vmax:g})",
+            }
         )
+
+    if not rows:
+        rows = [{"Factor": "No usable values entered", "Value used": np.nan, "Why highlighted": "Enter some values to see guidance."}]
+
+    return pd.DataFrame(rows)
 
 
 def manual_inputs_to_engineered_features(
@@ -267,6 +316,7 @@ def manual_inputs_to_engineered_features(
         v6_raw = inputs.get(var, {}).get("t6", None)
         v0_raw = inputs.get(var, {}).get("t0", None)
 
+        # binary vars
         if meta.get("type") == "binary":
             def yn_to_num(x: Any) -> float | None:
                 if x == "Yes":
@@ -295,6 +345,7 @@ def manual_inputs_to_engineered_features(
 
             continue
 
+        # numeric vars
         v12 = safe_float(v12_raw)
         v6 = safe_float(v6_raw)
         v0 = safe_float(v0_raw)
@@ -333,24 +384,53 @@ def count_variables_entered(inputs: dict[str, dict[str, Any]], starter_vars: lis
     return count
 
 
-def count_engineered_items_available(raw_engineered: dict, starter_vars: list[str]) -> tuple[int, int]:
-    present = 0
-    total = 0
-    for var in starter_vars:
-        for suffix in ["_mean", "_last"]:
-            k = f"{var}{suffix}"
-            total += 1
-            v = raw_engineered.get(k, np.nan)
-            if v is not None and not (isinstance(v, float) and np.isnan(v)):
-                present += 1
+def auto_group_vars(starter_vars: list[str]) -> dict[str, list[str]]:
+    """
+    Dynamic grouping based on name patterns, so BP ALWAYS ends up under Cardiac
+    even if your dataset uses slightly different variable names.
+    """
+    groups = {
+        "Respiratory & ventilation": [],
+        "Cardiac": [],
+        "Blood gas": [],
+        "Bloods / labs": [],
+        "Other": [],
+    }
 
-    if any(v.lower() == "mechvent" for v in starter_vars):
-        total += 1
-        v = raw_engineered.get("MechVent_prop_on", np.nan)
-        if v is not None and not (isinstance(v, float) and np.isnan(v)):
-            present += 1
+    for v in starter_vars:
+        vl = v.lower()
 
-    return present, total
+        # Cardiac patterns (BP + HR)
+        if any(k in vl for k in ["hr", "heart"]) and "hco3" not in vl:
+            groups["Cardiac"].append(v)
+            continue
+        if any(k in vl for k in ["bp", "map", "sbp", "dbp", "sys", "dias", "meanbp"]):
+            groups["Cardiac"].append(v)
+            continue
+
+        # Resp patterns
+        if any(k in vl for k in ["resp", "rr", "sao2", "spo2", "fio2", "mechvent", "vent"]):
+            groups["Respiratory & ventilation"].append(v)
+            continue
+
+        # Blood gas
+        if any(k in vl for k in ["ph", "lactate", "hco3", "bicarb", "pco2", "po2", "base"]):
+            groups["Blood gas"].append(v)
+            continue
+
+        # Bloods / labs
+        if any(k in vl for k in ["wbc", "plate", "plt", "creat", "bun", "urea", "glucose", "na", "k", "hct", "mg"]):
+            groups["Bloods / labs"].append(v)
+            continue
+
+        # Other
+        groups["Other"].append(v)
+
+    # Keep a stable order
+    for g in groups:
+        groups[g] = sorted(groups[g])
+
+    return groups
 
 
 # -----------------------------
@@ -364,10 +444,10 @@ st.caption("Educational demo only. Not for clinical use.")
 with st.expander("What this is (and isn’t)"):
     st.write(
         """
-        This demo estimates ICU mortality risk using a small set of routine observations and blood results.
+        This demo estimates ICU mortality risk using routine observations and blood results.
 
-        It’s a **portfolio demonstration** of how clinical decision-support software could work.
-        It has **not** been validated for real-world clinical use and must not be used for patient care.
+        It’s a **portfolio demonstration** of clinical decision-support software.
+        It has **not** been validated for real clinical use and must not be used for patient care.
         """
     )
 
@@ -393,27 +473,12 @@ c3.metric("HIGH risk", f"≥ {thr_high:.3f}")
 
 st.divider()
 
-if "page" not in st.session_state:
-    st.session_state.page = "Upload patient file (.txt)"
-
 page = st.radio(
     "Mode",
     ["Upload patient file (.txt)", "Manual entry"],
-    key="page",
     horizontal=True,
     label_visibility="collapsed",
 )
-
-# Persist explanation dropdown selection across reruns
-if "xai_choice" not in st.session_state:
-    st.session_state.xai_choice = "No explanation"
-
-# Cache last explanation output so it doesn't feel like it "resets"
-if "xai_df" not in st.session_state:
-    st.session_state.xai_df = None
-if "xai_msg" not in st.session_state:
-    st.session_state.xai_msg = ""
-
 
 # -----------------------------
 # Upload mode
@@ -423,69 +488,62 @@ if page == "Upload patient file (.txt)":
 
     if uploaded is None:
         st.info("Upload a patient file to generate a prediction.")
-    else:
-        if uploaded.size > MAX_UPLOAD_BYTES:
-            st.error("File too large for this demo (max 2MB).")
-        else:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-                tmp.write(uploaded.getbuffer())
-                tmp_path = Path(tmp.name)
+        st.stop()
 
-            try:
-                long_df = load_patient_long(tmp_path)
-                feats = summarise_patient(long_df)
+    if uploaded.size > MAX_UPLOAD_BYTES:
+        st.error("File too large for this demo (max 2MB).")
+        st.stop()
 
-                X_imp, present_count, missing_features, X_aligned = align_and_impute(
-                    feats, feature_columns, imputer
-                )
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+        tmp.write(uploaded.getbuffer())
+        tmp_path = Path(tmp.name)
 
-                prob = float(model.predict_proba(X_imp)[:, 1][0])
-                band = risk_band(prob, thr_low, thr_high)
+    try:
+        long_df = load_patient_long(tmp_path)
+        feats = summarise_patient(long_df)
 
-                st.subheader("Result")
-                show_risk_line(band)
-                st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
+        X_imp, present_count, missing_features, X_raw_aligned = align_and_impute(
+            feats, feature_columns, imputer
+        )
 
-                st.subheader("Missing data items")
-                st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
-                if missing_features:
-                    with st.expander("Show missing items"):
-                        clean = [humanise_feature_name(x) for x in missing_features]
-                        bullet_list(clean)
+        prob = float(model.predict_proba(X_imp)[:, 1][0])
+        band = risk_band(prob, thr_low, thr_high)
 
-                if band in ("MEDIUM", "HIGH"):
-                    st.subheader("Key contributing factors (explainable AI)")
-                    st.session_state.xai_choice = st.selectbox(
-                        "Show an explanation?",
-                        ["No explanation", "Yes — show key contributing factors"],
-                        index=0 if st.session_state.xai_choice == "No explanation" else 1,
-                        key="xai_choice_select_upload",
-                    )
+        st.subheader("Result")
+        show_risk_line(band)
+        st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
 
-                    if st.session_state.xai_choice != "No explanation":
-                        with st.spinner("Generating explanation..."):
-                            ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
-                        st.session_state.xai_msg = msg
-                        st.session_state.xai_df = df if ok else None
+        st.subheader("Missing data items")
+        st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
+        if missing_features:
+            with st.expander("Show missing items"):
+                clean = [humanise_feature_name(x) for x in missing_features]
+                bullet_list(clean)
 
-                        st.caption(
-                            "These factors show what the model used to form the score. "
-                            "They are not proof of causality."
-                        )
-                        if st.session_state.xai_df is not None:
-                            st.dataframe(st.session_state.xai_df, use_container_width=True)
-                        else:
-                            st.info(st.session_state.xai_msg)
+        # EXPLANATION: NOT OPTIONAL for MEDIUM/HIGH, and NEVER “does nothing”
+        if band in ("MEDIUM", "HIGH"):
+            st.subheader("Why this score (explainable view)")
+            with st.spinner("Generating explanation..."):
+                ok, df_shap, msg = try_shap_explain(model, X_imp, feature_columns, top_k=8)
 
-            except Exception as e:
-                st.error("Something went wrong while predicting from the uploaded file.")
-                with st.expander("Technical details (for debugging)"):
-                    st.exception(e)
-            finally:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            if ok and df_shap is not None:
+                st.caption("Model-based explanation (how the model pushed the risk up/down). Not proof of causality.")
+                st.dataframe(df_shap, use_container_width=True)
+            else:
+                st.caption(msg)
+                st.caption("Fallback explanation: highlights the most extreme values entered (clinician-friendly).")
+                df_fb = fallback_explanation_from_inputs(X_raw_aligned, top_k=8)
+                st.dataframe(df_fb, use_container_width=True)
+
+    except Exception as e:
+        st.error("Something went wrong while predicting from the uploaded file.")
+        with st.expander("Technical details (for debugging)"):
+            st.exception(e)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 # -----------------------------
 # Manual mode
@@ -493,191 +551,122 @@ if page == "Upload patient file (.txt)":
 else:
     if starter_vars is None or not isinstance(starter_vars, list) or len(starter_vars) == 0:
         st.warning("Manual entry is unavailable because this model bundle does not include `starter_vars`.")
-    else:
-        st.write(
-            """
-            Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
+        st.stop()
 
-            The model uses engineered values:
-            - **Average** of the values you entered
-            - **Most recent** value (Now → 6h → 12h)
-            """
-        )
+    st.write(
+        """
+        Enter values at **12 hours ago**, **6 hours ago**, and **Now**.
 
-        # Ensure ALL blood pressures are within Cardiac
-        GROUPS = {
-            "Respiratory & ventilation": ["RespRate", "SaO2", "FiO2", "MechVent"],
-            "Cardiac": ["HR", "SysBP", "DiasBP", "MeanBP"],
-            "Blood gas": ["pH", "HCO3", "Lactate"],
-            "Bloods / labs": ["Glucose", "Creatinine", "BUN", "WBC", "Platelets", "Na", "K", "Hct", "Mg"],
-            "Other": ["Temp"],
-        }
+        The model uses engineered values:
+        - **Average** of what you entered
+        - **Most recent** value (Now → 6h → 12h)
+        """
+    )
 
-        listed = {v for g in GROUPS.values() for v in g}
-        extras = [v for v in starter_vars if v not in listed]
+    GROUPS = auto_group_vars(starter_vars)
+    inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
 
-        inputs: dict[str, dict[str, Any]] = {v: {} for v in starter_vars}
+    submitted = False
+    with st.form("manual_form", clear_on_submit=False):
+        for group_name, var_list in GROUPS.items():
+            if not var_list:
+                continue
 
-        submitted = False
-        with st.form("manual_form", clear_on_submit=False):
-            for group_name, var_list in GROUPS.items():
-                vars_in_group = [v for v in var_list if v in starter_vars]
-                if not vars_in_group:
-                    continue
+            st.markdown(f"## {group_name}")
 
-                st.markdown(f"## {group_name}")
+            for var in var_list:
+                meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
+                label = meta.get("label", var)
+                units = meta.get("units", "")
+                vtype = meta.get("type", "num")
 
-                for var in vars_in_group:
-                    meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
-                    label = meta.get("label", var)
-                    units = meta.get("units", "")
-                    vtype = meta.get("type", "num")
+                st.markdown(f"**{label}**" + (f" ({units})" if units else ""))
+                cols = st.columns(3)
 
-                    st.markdown(f"**{label}**" + (f" ({units})" if units else ""))
-
-                    cols = st.columns(3)
-                    for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
-                        if vtype == "binary":
-                            inputs[var][tp_key] = cols[idx].selectbox(
-                                tp_label,
-                                options=["Missing", "Yes", "No"],
-                                index=0,
-                                key=f"{var}_{tp_key}_bin",
-                                help="Choose Yes / No. Leave as Missing if unknown.",
-                            )
-                        else:
-                            min_v = float(meta.get("min", -1e6))
-                            max_v = float(meta.get("max", 1e6))
-
-                            help_text = f"Please enter a value between {min_v:g} and {max_v:g}"
-                            if units:
-                                help_text += f" {units}"
-
-                            step = 0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0)
-
-                            inputs[var][tp_key] = cols[idx].number_input(
-                                tp_label,
-                                min_value=min_v,
-                                max_value=max_v,
-                                value=None,
-                                step=step,
-                                key=f"{var}_{tp_key}_num",
-                                help=help_text,
-                            )
-
-                    st.write("")
-
-                st.divider()
-
-            if extras:
-                st.markdown("## Other variables (used by this model)")
-                for var in extras:
-                    meta = VAR_META.get(var, {"label": var, "units": "", "min": -1e6, "max": 1e6, "type": "num"})
-                    label = meta.get("label", var)
-                    units = meta.get("units", "")
-                    vtype = meta.get("type", "num")
-
-                    st.markdown(f"**{label}**" + (f" ({units})" if units else ""))
-                    cols = st.columns(3)
-                    for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
-                        if vtype == "binary":
-                            inputs[var][tp_key] = cols[idx].selectbox(
-                                tp_label,
-                                options=["Missing", "Yes", "No"],
-                                index=0,
-                                key=f"{var}_{tp_key}_bin_extra",
-                            )
-                        else:
-                            min_v = float(meta.get("min", -1e6))
-                            max_v = float(meta.get("max", 1e6))
-                            inputs[var][tp_key] = cols[idx].number_input(
-                                tp_label,
-                                min_value=min_v,
-                                max_value=max_v,
-                                value=None,
-                                step=0.1,
-                                key=f"{var}_{tp_key}_num_extra",
-                            )
-                    st.write("")
-                st.divider()
-
-            submitted = st.form_submit_button("Calculate risk")
-
-        if submitted:
-            try:
-                entered_vars = count_variables_entered(inputs, starter_vars)
-
-                raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
-                eng_present, eng_total = count_engineered_items_available(raw_engineered, starter_vars)
-
-                X_imp, _present_count, missing_features, _X_aligned = align_and_impute(
-                    raw_engineered, feature_columns, imputer
-                )
-
-                prob = float(model.predict_proba(X_imp)[:, 1][0])
-                band = risk_band(prob, thr_low, thr_high)
-
-                st.subheader("Result")
-                show_risk_line(band)
-                st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
-
-                st.subheader("What the model actually used")
-                st.write(
-                    f"- Clinical variables entered: **{entered_vars}/{len(starter_vars)}**\n"
-                    f"- Engineered values created (average + most recent): **{eng_present}/{eng_total}**"
-                )
-
-                with st.expander("What does “engineered values” mean?"):
-                    st.write(
-                        """
-                        The model doesn’t take raw “12h/6h/now” directly.
-                        For each variable it creates:
-                        - **Average** = average of the values you entered
-                        - **Most recent** = the latest value available (Now → 6h → 12h)
-
-                        For ventilation:
-                        - **MechVent** is treated as Yes=1 / No=0, and the average becomes a rough “proportion on”.
-                        """
-                    )
-
-                st.subheader("Missing data items")
-                st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
-                if missing_features:
-                    with st.expander("Show missing items"):
-                        clean = [humanise_feature_name(x) for x in missing_features]
-                        bullet_list(clean)
-
-                if band in ("MEDIUM", "HIGH"):
-                    st.subheader("Key contributing factors (explainable AI)")
-                    st.session_state.xai_choice = st.selectbox(
-                        "Show an explanation?",
-                        ["No explanation", "Yes — show key contributing factors"],
-                        index=0 if st.session_state.xai_choice == "No explanation" else 1,
-                        key="xai_choice_select_manual",
-                    )
-
-                    if st.session_state.xai_choice != "No explanation":
-                        with st.spinner("Generating explanation..."):
-                            ok, msg, df = try_shap_explain(model, X_imp, feature_columns, top_k=8)
-                        st.session_state.xai_msg = msg
-                        st.session_state.xai_df = df if ok else None
-
-                        st.caption(
-                            "These factors show what the model used to form the score. "
-                            "They are not proof of causality."
+                for idx, (tp_label, tp_key) in enumerate(TIMEPOINTS):
+                    if vtype == "binary":
+                        inputs[var][tp_key] = cols[idx].selectbox(
+                            tp_label,
+                            options=["Missing", "Yes", "No"],
+                            index=0,
+                            key=f"{var}_{tp_key}_bin",
+                            help="Choose Yes / No. Leave as Missing if unknown.",
                         )
-                        if st.session_state.xai_df is not None:
-                            st.dataframe(st.session_state.xai_df, use_container_width=True)
-                        else:
-                            st.info(st.session_state.xai_msg)
+                    else:
+                        min_v = float(meta.get("min", -1e6))
+                        max_v = float(meta.get("max", 1e6))
 
-            except Exception as e:
-                st.error("Something went wrong while calculating risk.")
-                with st.expander("Technical details (for debugging)"):
-                    st.exception(e)
+                        # range warning is built into number_input via min/max
+                        help_text = f"Please enter a value between {min_v:g} and {max_v:g}"
+                        if units:
+                            help_text += f" {units}"
+
+                        step = 0.01 if (max_v - min_v) <= 1 else (0.1 if (max_v - min_v) <= 20 else 1.0)
+
+                        inputs[var][tp_key] = cols[idx].number_input(
+                            tp_label,
+                            min_value=min_v,
+                            max_value=max_v,
+                            value=None,
+                            step=step,
+                            key=f"{var}_{tp_key}_num",
+                            help=help_text,
+                        )
+
+                st.write("")
+
+            st.divider()
+
+        submitted = st.form_submit_button("Calculate risk")
+
+    if submitted:
+        try:
+            entered_vars = count_variables_entered(inputs, starter_vars)
+
+            raw_engineered = manual_inputs_to_engineered_features(inputs, starter_vars)
+            X_imp, present_count, missing_features, X_raw_aligned = align_and_impute(
+                raw_engineered, feature_columns, imputer
+            )
+
+            prob = float(model.predict_proba(X_imp)[:, 1][0])
+            band = risk_band(prob, thr_low, thr_high)
+
+            st.subheader("Result")
+            show_risk_line(band)
+            st.metric("Predicted mortality risk (probability)", f"{prob:.6f}")
+
+            st.subheader("Data completeness")
+            st.write(f"Clinical variables entered: **{entered_vars}/{len(starter_vars)}**")
+
+            st.subheader("Missing data items")
+            st.write(f"Missing items used by the model (imputed): **{len(missing_features)}**")
+            if missing_features:
+                with st.expander("Show missing items"):
+                    clean = [humanise_feature_name(x) for x in missing_features]
+                    bullet_list(clean)
+
+            # EXPLANATION: NOT OPTIONAL for MEDIUM/HIGH, and NEVER “does nothing”
+            if band in ("MEDIUM", "HIGH"):
+                st.subheader("Why this score (explainable view)")
+                with st.spinner("Generating explanation..."):
+                    ok, df_shap, msg = try_shap_explain(model, X_imp, feature_columns, top_k=8)
+
+                if ok and df_shap is not None:
+                    st.caption("Model-based explanation (how the model pushed the risk up/down). Not proof of causality.")
+                    st.dataframe(df_shap, use_container_width=True)
+                else:
+                    st.caption(msg)
+                    st.caption("Fallback explanation: highlights the most extreme values entered (clinician-friendly).")
+                    df_fb = fallback_explanation_from_inputs(X_raw_aligned, top_k=8)
+                    st.dataframe(df_fb, use_container_width=True)
+
+        except Exception as e:
+            st.error("Something went wrong while calculating risk.")
+            with st.expander("Technical details (for debugging)"):
+                st.exception(e)
 
 with st.expander("Technical details (for reviewers / developers)"):
     st.write(f"Bundle path: `{bundle_path.as_posix()}`")
     st.write(f"Features expected: {len(feature_columns)}")
     st.write(f"Starter vars in bundle: {len(starter_vars) if isinstance(starter_vars, list) else 'missing'}")
-    st.write(f"Explainable AI available: {SHAP_AVAILABLE}")
+    st.write(f"SHAP available: {SHAP_AVAILABLE}")
