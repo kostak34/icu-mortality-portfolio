@@ -92,7 +92,6 @@ MANUAL_FIELDS = {
 }
 
 # Map model feature names to clinician-readable labels for reporting missing/driver features.
-# Falls back to a generic prettifier if unknown.
 BASE_LABELS = {fs.key_base: (fs.label, fs.unit) for group in MANUAL_FIELDS.values() for fs in group}
 
 
@@ -130,9 +129,6 @@ def pretty_model_feature_name(col: str) -> str:
 
 
 def feature_category(col: str) -> str:
-    """
-    Assign a model feature to a clinician category using its base variable.
-    """
     base = col
     for sfx in ("_mean", "_last", "_was_measured"):
         if base.endswith(sfx):
@@ -177,14 +173,6 @@ def align_and_impute(
     feature_columns: list[str],
     imputer: Any
 ) -> tuple[pd.DataFrame, int, list[str], pd.DataFrame]:
-    """
-    Create 1-row frame in training column order, count present pre-imputation,
-    list missing columns (for reporting), and return:
-      - X_imp (imputed)
-      - present_count
-      - missing_cols
-      - X_aligned (pre-imputation, aligned)
-    """
     X = pd.DataFrame([feats])
 
     for c in feature_columns:
@@ -192,7 +180,6 @@ def align_and_impute(
             X[c] = np.nan
 
     X = X[feature_columns]
-
     X = X.where(pd.notna(X), np.nan)
     X = X.apply(pd.to_numeric, errors="coerce")
 
@@ -201,7 +188,6 @@ def align_and_impute(
     present_count = int((~missing_mask).sum())
 
     X_imp = pd.DataFrame(imputer.transform(X), columns=feature_columns)
-
     return X_imp, present_count, missing_cols, X
 
 
@@ -321,7 +307,7 @@ def explain_top_drivers(
 
 
 # -----------------------------
-# Manual entry engineering
+# Manual entry parsing/engineering
 # -----------------------------
 def _parse_number(text: str, spec: FieldSpec) -> tuple[Optional[float], Optional[str]]:
     t = (text or "").strip()
@@ -370,7 +356,7 @@ st.caption("For demonstration and education only — not a clinical decision too
 with st.expander("What this tool does", expanded=False):
     st.write(
         "This demo estimates mortality risk using a model trained on a **public ICU dataset**. "
-        "It converts observations into inputs the model understands, and then produces a risk estimate and risk band. "
+        "It converts observations into inputs the model understands, then produces a risk estimate and risk band. "
         "If information is missing, the app can (optionally) use **typical values** from training data to complete the calculation."
     )
 
@@ -410,10 +396,20 @@ st.caption(
     "• **Estimate:** can still give a result with limited data, but may rely on typical values."
 )
 
-result_container = st.container()
+
+def strict_gate_ok(engineered_present_count: int, observations_entered: int) -> tuple[bool, str]:
+    total = len(feature_columns)
+    frac = engineered_present_count / max(total, 1)
+    if observations_entered < STRICT_MIN_OBSERVATIONS_ENTERED:
+        return False, f"Not enough observations entered (need at least {STRICT_MIN_OBSERVATIONS_ENTERED})."
+    if frac < STRICT_MIN_ENGINEERED_PRESENT_FRAC:
+        need = int(np.ceil(STRICT_MIN_ENGINEERED_PRESENT_FRAC * total))
+        return False, f"Not enough model inputs available (need about {need} of {total})."
+    return True, ""
 
 
 def render_result(
+    container: Any,
     prob: float,
     present_count: int,
     missing_cols: list[str],
@@ -427,7 +423,7 @@ def render_result(
     band = risk_band(prob, thr_medium, thr_high)
     rel_text, rel_dot = reliability_label(present_frac)
 
-    with result_container:
+    with container:
         st.subheader("Result")
         st.markdown(f"### {band_dot(band)} {band} RISK")
         st.metric("Estimated mortality risk", f"{prob*100:.2f}%")
@@ -500,23 +496,15 @@ def render_result(
             st.write(f"Bundle path: `{bundle_path.as_posix()}`")
 
 
-def strict_gate_ok(engineered_present_count: int, observations_entered: int) -> tuple[bool, str]:
-    total = len(feature_columns)
-    frac = engineered_present_count / max(total, 1)
-    if observations_entered < STRICT_MIN_OBSERVATIONS_ENTERED:
-        return False, f"Not enough observations entered (need at least {STRICT_MIN_OBSERVATIONS_ENTERED})."
-    if frac < STRICT_MIN_ENGINEERED_PRESENT_FRAC:
-        need = int(np.ceil(STRICT_MIN_ENGINEERED_PRESENT_FRAC * total))
-        return False, f"Not enough model inputs available (need about {need} of {total})."
-    return True, ""
-
-
 # -----------------------------
 # Upload patient file mode
 # -----------------------------
 if input_method == "Upload patient file":
     st.subheader("Upload patient file")
     uploaded = st.file_uploader("Upload a single patient `.txt` file", type=["txt"])
+
+    # Results should appear BELOW the uploader
+    upload_result_container = st.container()
 
     if uploaded is None:
         st.info("Upload a patient file to get a prediction.")
@@ -542,16 +530,18 @@ if input_method == "Upload patient file":
         if mode.startswith("Strict"):
             ok, reason = strict_gate_ok(engineered_present_count, observations_entered)
             if not ok:
-                st.warning(
-                    "Strict mode: insufficient data to provide a meaningful estimate.\n\n"
-                    f"Reason: {reason}\n\n"
-                    "Switch to **Estimate mode** if you still want an approximate result using typical values."
-                )
+                with upload_result_container:
+                    st.warning(
+                        "Strict mode: insufficient data to provide a meaningful estimate.\n\n"
+                        f"Reason: {reason}\n\n"
+                        "Switch to **Estimate mode** if you still want an approximate result using typical values."
+                    )
                 st.stop()
 
         prob = float(model.predict_proba(X_imp)[:, 1][0])
 
-        render_result(
+        # Persist so it doesn't vanish on rerun
+        st.session_state["upload_result"] = dict(
             prob=prob,
             present_count=present_count,
             missing_cols=missing_cols,
@@ -561,9 +551,23 @@ if input_method == "Upload patient file":
             engineered_present_count=engineered_present_count,
         )
 
+        res = st.session_state.get("upload_result")
+        if res:
+            render_result(
+                container=upload_result_container,
+                prob=res["prob"],
+                present_count=res["present_count"],
+                missing_cols=res["missing_cols"],
+                X_imp=res["X_imp"],
+                X_aligned=res["X_aligned"],
+                observations_entered=res["observations_entered"],
+                engineered_present_count=res["engineered_present_count"],
+            )
+
     except Exception as e:
-        st.error("Something went wrong while predicting.")
-        st.exception(e)
+        with upload_result_container:
+            st.error("Something went wrong while predicting.")
+            st.exception(e)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -637,7 +641,13 @@ if input_method == "Manual entry":
                 uniq.append(e)
         st.warning("Some entries looked invalid and will be treated as missing:\n\n" + "\n".join([f"• {e}" for e in uniq]))
 
-    if st.button("Calculate risk", type="primary"):
+    # Button FIRST
+    calculate = st.button("Calculate risk", type="primary")
+
+    # And the results container IMMEDIATELY BELOW it (so results appear below the form/button)
+    manual_result_container = st.container()
+
+    if calculate:
         try:
             feats: dict[str, Any] = {}
 
@@ -664,16 +674,18 @@ if input_method == "Manual entry":
             if mode.startswith("Strict"):
                 ok, reason = strict_gate_ok(engineered_present_count, observations_entered)
                 if not ok:
-                    st.warning(
-                        "Strict mode: insufficient data to provide a meaningful estimate.\n\n"
-                        f"Reason: {reason}\n\n"
-                        "Switch to **Estimate mode** if you still want an approximate result using typical values."
-                    )
+                    with manual_result_container:
+                        st.warning(
+                            "Strict mode: insufficient data to provide a meaningful estimate.\n\n"
+                            f"Reason: {reason}\n\n"
+                            "Switch to **Estimate mode** if you still want an approximate result using typical values."
+                        )
                     st.stop()
 
             prob = float(model.predict_proba(X_imp)[:, 1][0])
 
-            render_result(
+            # Persist result so it stays visible after reruns
+            st.session_state["manual_result"] = dict(
                 prob=prob,
                 present_count=present_count,
                 missing_cols=missing_cols,
@@ -684,5 +696,20 @@ if input_method == "Manual entry":
             )
 
         except Exception as e:
-            st.error("Something went wrong while predicting.")
-            st.exception(e)
+            with manual_result_container:
+                st.error("Something went wrong while predicting.")
+                st.exception(e)
+
+    # Always render the latest manual result (if present) BELOW the button/form
+    res = st.session_state.get("manual_result")
+    if res:
+        render_result(
+            container=manual_result_container,
+            prob=res["prob"],
+            present_count=res["present_count"],
+            missing_cols=res["missing_cols"],
+            X_imp=res["X_imp"],
+            X_aligned=res["X_aligned"],
+            observations_entered=res["observations_entered"],
+            engineered_present_count=res["engineered_present_count"],
+        )
