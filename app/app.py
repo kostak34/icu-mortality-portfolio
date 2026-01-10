@@ -1,32 +1,35 @@
+# app/app.py
 """
-Streamlit demo app (educational).
+ICU Mortality Risk Demo (Portfolio)
 
-Notes:
-- Requires a saved model bundle at outputs/model_bundle.joblib
-- Allows a user to upload a single patient file (.txt) OR manually enter observations
-- Returns calibrated probability + risk band
-- Includes a clinician-friendly “Why this estimate?” section (“pushes risk”)
+Clinician-facing demo UI around a pre-trained model bundle.
+- Upload a single patient .txt (same format as your dataset)
+- OR enter observations manually at 12h / 6h / Now
+
+Important:
+- Demo / education only. Not for clinical use.
+- In "Estimate mode", missing model inputs are filled using training-set typical values
+  (via the saved imputer). This is clearly disclosed to the user.
+- In "Strict mode" (default), the app will refuse to predict if there isn't enough data.
 """
+
 from __future__ import annotations
 
-from pathlib import Path
 import sys
+from pathlib import Path
 import tempfile
-import json
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-
-# -----------------------------
-# Path setup (robust imports)
-# -----------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (one level above /app)
-
-# Ensure project root is importable so `import scripts...` works everywhere
+# -----------------------------------------------------------------------------
+# Robust imports: make project root importable so `import scripts...` works on
+# Streamlit Cloud (main module is app/app.py).
+# -----------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -34,616 +37,437 @@ from scripts.step_01_load_raw import load_patient_long  # type: ignore
 from scripts.step_02_batch_features import summarise_patient  # type: ignore
 
 
-# -----------------------------
-# Constants / defaults
-# -----------------------------
-DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
-DEFAULT_MEDIUM_THRESHOLD = 0.10  # LOW < 0.10, MEDIUM [0.10..HIGH), HIGH >= HIGH_THR
-MAX_UPLOAD_BYTES = 2_000_000
-
-# “Strict mode” minimums (tune these if you want)
-MIN_RAW_VARIABLES_FOR_STRICT_MANUAL = 6
-MIN_PRESENT_FEATURES_FOR_STRICT_UPLOAD = 20
+# -----------------------------------------------------------------------------
+# Paths / constants
+# -----------------------------------------------------------------------------
+BUNDLE_PATH = PROJECT_ROOT / "outputs" / "model_bundle.joblib"
+DEFAULT_MEDIUM_THRESHOLD = 0.10
+STRICT_MIN_PRESENT_FEATURES = 20  # guardrail; tune if needed
+STRICT_MIN_MEASUREMENTS_ENTERED = 4  # guardrail; tune if needed
+MAX_UPLOAD_BYTES = 2_000_000  # 2MB
 
 
-# -----------------------------
-# Bundle loader
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Clinician-friendly labels + ranges for manual entry
+# -----------------------------------------------------------------------------
+def _label(base: str) -> str:
+    return {
+        "HeartRate": "Heart rate (bpm)",
+        "MeanBP": "Mean arterial pressure (NIBP) (mmHg)",
+        "SysBP": "Systolic BP (NIBP) (mmHg)",
+        "DiasBP": "Diastolic BP (NIBP) (mmHg)",
+        "RespRate": "Respiratory rate (breaths/min)",
+        "SaO2": "SaO₂ (%)",
+        "FiO2": "FiO₂ (fraction) — enter 0.21 to 1.00",
+        "MechVent": "Mechanical ventilation",
+        "pH": "pH",
+        "HCO3": "HCO₃⁻ (mmol/L)",
+        "Lactate": "Lactate (mmol/L)",
+        "Glucose": "Glucose (mmol/L)",
+        "Na": "Sodium (Na) (mmol/L)",
+        "K": "Potassium (K) (mmol/L)",
+        "Mg": "Magnesium (Mg) (mmol/L)",
+        "Creatinine": "Creatinine (µmol/L)",
+        "BUN": "Urea (BUN) (mg/dL)",
+        "Platelets": "Platelets (×10⁹/L)",
+        "HCT": "Haematocrit (%)",
+        "GCS": "GCS",
+    }.get(base, base)
+
+
+RANGES: Dict[str, Tuple[float, float, str]] = {
+    "HeartRate": (0, 250, "bpm"),
+    "MeanBP": (0, 200, "mmHg"),
+    "SysBP": (0, 300, "mmHg"),
+    "DiasBP": (0, 200, "mmHg"),
+    "RespRate": (0, 80, "breaths/min"),
+    "SaO2": (0, 100, "%"),
+    "FiO2": (0.21, 1.0, "fraction"),
+    "pH": (6.8, 7.8, ""),
+    "HCO3": (0, 60, "mmol/L"),
+    "Lactate": (0, 30, "mmol/L"),
+    "Glucose": (0, 60, "mmol/L"),
+    "Na": (90, 200, "mmol/L"),
+    "K": (0, 10, "mmol/L"),
+    "Mg": (0, 5, "mmol/L"),
+    "Creatinine": (0, 2000, "µmol/L"),
+    "BUN": (0, 200, "mg/dL"),
+    "Platelets": (0, 2000, "×10⁹/L"),
+    "HCT": (0, 80, "%"),
+    "GCS": (3, 15, ""),
+}
+
+
+# -----------------------------------------------------------------------------
+# Bundle loading
+# -----------------------------------------------------------------------------
 @st.cache_resource
-def load_bundle(bundle_path: Path) -> dict:
-    return joblib.load(bundle_path)
+def load_bundle(path: Path) -> Dict[str, Any]:
+    return joblib.load(path)
 
 
-# -----------------------------
-# Utility: feature name prettifier
-# -----------------------------
-def pretty_label(feature_name: str) -> str:
-    """
-    Convert model feature names to clinician-friendly labels.
-    Examples:
-      HeartRate_mean -> Heart rate (mean)
-      FiO2_last -> FiO₂ (most recent)
-      MechVent_prop_on -> Mechanical ventilation (proportion on)
-      GCS_last -> GCS (most recent)
-    """
-    s = feature_name
+# -----------------------------------------------------------------------------
+# Helpers: missing features formatting (clinician-friendly)
+# -----------------------------------------------------------------------------
+def _format_feature_name(model_feature: str) -> str:
+    # Turn "RespRate_mean" -> "Respiratory rate (breaths/min) — average"
+    suffix_map = {"_mean": "average", "_last": "latest", "_was_measured": "recorded"}
+    for suf, human in suffix_map.items():
+        if model_feature.endswith(suf):
+            base = model_feature[: -len(suf)]
+            return f"{_label(base)} — {human}"
 
-    # common replacements
-    s = s.replace("FiO2", "FiO₂")
-    s = s.replace("SaO2", "SaO₂")
-    s = s.replace("MechVent", "Mechanical ventilation")
-    s = s.replace("HeartRate", "Heart rate")
-    s = s.replace("RespRate", "Respiratory rate")
-    s = s.replace("SysBP", "Systolic BP")
-    s = s.replace("DiasBP", "Diastolic BP")
-    s = s.replace("MeanBP", "Mean arterial pressure")
-    s = s.replace("HCT", "Haematocrit")
-    s = s.replace("WBC", "White cell count")
-    s = s.replace("BUN", "Urea (BUN)")
+    if model_feature == "MechVent_prop_on":
+        return f"{_label('MechVent')} — proportion on"
 
-    # suffixes
-    if s.endswith("_mean"):
-        s = s.replace("_mean", " (mean)")
-    elif s.endswith("_last"):
-        s = s.replace("_last", " (most recent)")
-    elif s.endswith("_was_measured"):
-        s = s.replace("_was_measured", " (was measured)")
-    elif s.endswith("_prop_on"):
-        s = s.replace("_prop_on", " (proportion on)")
-
-    # spacing
-    s = s.replace("_", " ")
-    return s
+    # fallback: de-snake
+    return model_feature.replace("_", " ")
 
 
-# -----------------------------
-# Align + impute safely (NO pd.NA reaching sklearn)
-# -----------------------------
+def format_missing_features(missing_features: List[str]) -> List[str]:
+    pretty = [_format_feature_name(f) for f in missing_features]
+    # unique but stable
+    seen = set()
+    out = []
+    for p in pretty:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Core: align + impute safely (NO pd.NA leakage into sklearn)
+# -----------------------------------------------------------------------------
 def align_and_impute(
-    feats: dict,
-    feature_columns: list[str],
-    imputer: Any,
-) -> tuple[pd.DataFrame, int, list[str], pd.DataFrame]:
+    feats: Dict[str, Any],
+    feature_columns: List[str],
+    imputer,
+) -> Tuple[pd.DataFrame, int, List[str], pd.DataFrame]:
     """
-    Build a one-row dataframe in training feature order, report missing features,
-    then return imputed X plus aligned (pre-imputation) X.
-
-    IMPORTANT:
-    - sklearn cannot handle pd.NA in this path reliably; we convert everything to np.nan
+    Returns:
+      X_imp: imputed DataFrame (model input)
+      present_count: non-missing model features BEFORE imputation
+      missing_features: list[str] of model feature names missing pre-imputation
+      X_aligned: aligned numeric DataFrame pre-imputation (for transparency)
     """
     X = pd.DataFrame([feats])
 
-    # Ensure all expected columns exist
     for c in feature_columns:
         if c not in X.columns:
             X[c] = np.nan
 
-    # Keep ONLY training columns in correct order
     X = X[feature_columns]
 
-    # Replace pd.NA / None with np.nan, then coerce to numeric
+    # Normalize missing markers (IMPORTANT)
     X = X.replace({pd.NA: np.nan})
-    X = X.where(pd.notna(X), np.nan)
 
-    # to_numeric per column
-    for col in X.columns:
-        try:
-            X[col] = pd.to_numeric(X[col], errors="coerce")
-        except Exception:
-            X[col] = np.nan
+    # Force numeric; anything else becomes NaN
+    X = X.apply(pd.to_numeric, errors="coerce")
 
-    # Missing feature reporting (pre-imputation)
     missing_mask = X.isna().iloc[0]
     missing_features = X.columns[missing_mask].tolist()
     present_count = int((~missing_mask).sum())
 
-    # Impute
-    X_imp_arr = imputer.transform(X)
-    X_imp = pd.DataFrame(X_imp_arr, columns=feature_columns)
+    X_aligned = X.copy()
 
-    return X_imp, present_count, missing_features, X
+    X_imp = pd.DataFrame(imputer.transform(X), columns=feature_columns)
+    return X_imp, present_count, missing_features, X_aligned
 
 
-# -----------------------------
-# Explainability: “pushes risk”
-# -----------------------------
-def top_pushes_risk(
+# -----------------------------------------------------------------------------
+# Explainability: always return something useful (SHAP if possible, else fallback)
+# -----------------------------------------------------------------------------
+def _get_explain_model(bundle: Dict[str, Any]):
+    m = bundle["model"]
+    # If it's calibrated, try to pull underlying estimator used in calibrator
+    if hasattr(m, "calibrated_classifiers_") and getattr(m, "calibrated_classifiers_", None):
+        try:
+            return m.calibrated_classifiers_[0].estimator
+        except Exception:
+            return m
+    return m
+
+
+def compute_top_drivers(
+    bundle: Dict[str, Any],
     X_imp: pd.DataFrame,
-    feature_columns: list[str],
-    model: Any,
-    imputer: Any,
-    k: int = 5,
+    X_aligned: pd.DataFrame,
+    feature_columns: List[str],
+    top_n: int = 5,
 ) -> pd.DataFrame:
     """
-    Simple, stable, no-SHAP explanation:
-    - Uses RF feature_importances_ (global)
-    - Uses imputer.statistics_ as “typical” baseline (median from training)
-    - Computes a “push score” = importance * (value - typical)
-    - Shows top positive pushes only
-
-    This is not causation — it’s an intuitive “what’s unusual in the risky direction” display.
+    Returns a table of top factors that *push risk up* for this patient.
+    If SHAP fails, falls back to global feature_importances_.
     """
-    if not hasattr(model, "estimators_") and not hasattr(model, "base_estimator"):
-        return pd.DataFrame(columns=["Factor", "Your value", "Typical", "Push score"])
+    explain_model = _get_explain_model(bundle)
 
-    # Try to get importances from underlying RF (CalibratedClassifierCV wraps estimator)
-    base = getattr(model, "estimator", None)
-    if base is None and hasattr(model, "calibrated_classifiers_"):
-        # older sklearn structures
-        base = getattr(model.calibrated_classifiers_[0], "estimator", None)
+    # Try SHAP
+    try:
+        import shap  # lazy import
+        explainer = shap.TreeExplainer(explain_model)
+        sv = explainer.shap_values(X_imp)
 
-    rf = base if base is not None else model
+        if isinstance(sv, list):
+            sv_pos = np.asarray(sv[1])[0]  # class 1
+        else:
+            sv_arr = np.asarray(sv)
+            if sv_arr.ndim == 3:
+                sv_pos = sv_arr[0, :, 1]
+            else:
+                sv_pos = sv_arr[0]
 
-    if not hasattr(rf, "feature_importances_"):
-        return pd.DataFrame(columns=["Factor", "Your value", "Typical", "Push score"])
+        rows = []
+        for i, f in enumerate(feature_columns):
+            shap_val = float(sv_pos[i])
+            if shap_val <= 0:
+                continue  # ONLY pushes risk up
 
-    importances = np.asarray(rf.feature_importances_, dtype=float)
-    if len(importances) != len(feature_columns):
-        return pd.DataFrame(columns=["Factor", "Your value", "Typical", "Push score"])
+            raw_val = X_aligned.iloc[0][f]
+            imp_val = float(X_imp.iloc[0][i])
+            is_imputed = pd.isna(raw_val)
+            shown_val = imp_val if is_imputed else float(raw_val)
 
-    # Typical baseline (training medians) if available
-    typical = getattr(imputer, "statistics_", None)
-    if typical is None or len(typical) != len(feature_columns):
-        typical = np.zeros(len(feature_columns), dtype=float)
+            rows.append(
+                {
+                    "Factor": _format_feature_name(f),
+                    "Value used": shown_val,
+                    "Imputed?": "Yes" if is_imputed else "No",
+                    "Pushes risk by": shap_val,
+                }
+            )
 
-    x = X_imp.iloc[0].to_numpy(dtype=float)
-    typical = np.asarray(typical, dtype=float)
+        df = pd.DataFrame(rows).sort_values("Pushes risk by", ascending=False).head(top_n)
+        if not df.empty:
+            return df.reset_index(drop=True)
 
-    push = importances * (x - typical)
+        # If nothing positive, show top absolute influence (still patient-specific)
+        rows = []
+        for i, f in enumerate(feature_columns):
+            shap_val = float(sv_pos[i])
+            raw_val = X_aligned.iloc[0][f]
+            imp_val = float(X_imp.iloc[0][i])
+            is_imputed = pd.isna(raw_val)
+            shown_val = imp_val if is_imputed else float(raw_val)
+            rows.append(
+                {
+                    "Factor": _format_feature_name(f),
+                    "Value used": shown_val,
+                    "Imputed?": "Yes" if is_imputed else "No",
+                    "Influence (abs)": abs(shap_val),
+                }
+            )
+        df2 = pd.DataFrame(rows).sort_values("Influence (abs)", ascending=False).head(top_n)
+        return df2.reset_index(drop=True)
 
-    rows = []
-    for i, fname in enumerate(feature_columns):
-        rows.append(
-            {
-                "Factor": pretty_label(fname),
-                "Your value": float(x[i]),
-                "Typical": float(typical[i]),
-                "Push score": float(push[i]),
-            }
-        )
+    except Exception:
+        # Fallback: global feature importance
+        if hasattr(explain_model, "feature_importances_"):
+            imp = np.asarray(explain_model.feature_importances_, dtype=float)
+            order = np.argsort(imp)[::-1][:top_n]
+            rows = []
+            for idx in order:
+                f = feature_columns[idx]
+                raw_val = X_aligned.iloc[0][f]
+                imp_val = float(X_imp.iloc[0][idx])
+                is_imputed = pd.isna(raw_val)
+                shown_val = imp_val if is_imputed else float(raw_val)
+                rows.append(
+                    {
+                        "Factor": _format_feature_name(f),
+                        "Value used": shown_val,
+                        "Imputed?": "Yes" if is_imputed else "No",
+                        "Model importance": float(imp[idx]),
+                    }
+                )
+            return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values("Push score", ascending=False)
-
-    # Keep only positive pushes (increasing risk direction)
-    df = df[df["Push score"] > 0].head(k).copy()
-    df["Push score"] = df["Push score"].round(4)
-
-    return df
+        return pd.DataFrame([{"Factor": "Explanation unavailable."}])
 
 
-# -----------------------------
-# Risk band logic
-# -----------------------------
-def risk_band(prob: float, thr_low: float, thr_high: float) -> str:
-    if prob < thr_low:
+# -----------------------------------------------------------------------------
+# Risk banding
+# -----------------------------------------------------------------------------
+def risk_band(prob: float, thr_medium: float, thr_high: float) -> str:
+    if prob < thr_medium:
         return "LOW"
     if prob < thr_high:
         return "MEDIUM"
     return "HIGH"
 
 
-def band_dot(band: str) -> str:
-    return {"LOW": "🟢", "MEDIUM": "🟠", "HIGH": "🔴"}.get(band, "⚪")
+def band_badge(band: str) -> str:
+    return {"LOW": "🟢 LOW RISK", "MEDIUM": "🟠 MEDIUM RISK", "HIGH": "🔴 HIGH RISK"}[band]
 
 
-# -----------------------------
-# Manual input config
-# -----------------------------
-# Each manual row defines:
-# - key base (used to build engineered vars)
-# - label
-# - widget type & constraints
-MANUAL_FIELDS = [
-    # Cardiac
-    ("HeartRate", "Heart rate (bpm)", "num", 0.0, 250.0, 1.0),
-    ("MeanBP", "Mean arterial pressure (NIBP) (mmHg)", "num", 0.0, 160.0, 1.0),
-    ("SysBP", "Systolic BP (NIBP) (mmHg)", "num", 0.0, 300.0, 1.0),
-    ("DiasBP", "Diastolic BP (NIBP) (mmHg)", "num", 0.0, 200.0, 1.0),
-    # Respiratory
-    ("RespRate", "Respiratory rate (breaths/min)", "num", 0.0, 80.0, 1.0),
-    ("SaO2", "SaO₂ (%)", "num", 0.0, 100.0, 1.0),
-    ("FiO2", "FiO₂ (fraction) — enter 0.21 to 1.00", "num", 0.21, 1.0, 0.01),
-    ("MechVent", "Mechanical ventilation", "bool", None, None, None),
-    # Blood gas
-    ("pH", "pH", "num", 6.8, 7.8, 0.01),
-    ("HCO3", "HCO₃⁻ (mmol/L)", "num", 0.0, 60.0, 0.1),
-    # Bloods
-    ("Na", "Sodium (Na) (mmol/L)", "num", 90.0, 200.0, 1.0),
-    ("K", "Potassium (K) (mmol/L)", "num", 1.0, 9.0, 0.1),
-    ("Mg", "Magnesium (Mg) (mmol/L)", "num", 0.2, 3.5, 0.1),
-    ("Creatinine", "Creatinine (µmol/L)", "num", 0.0, 2000.0, 1.0),
-    ("BUN", "Urea (BUN) (mg/dL)", "num", 0.0, 200.0, 0.5),
-    ("Platelets", "Platelets (x10⁹/L)", "num", 0.0, 2000.0, 1.0),
-    ("HCT", "Haematocrit (%)", "num", 0.0, 80.0, 0.5),
-    ("Glucose", "Glucose (mmol/L)", "num", 0.0, 60.0, 0.1),
-    ("Lactate", "Lactate (mmol/L)", "num", 0.0, 25.0, 0.1),
-    # Other
-    ("GCS", "GCS", "int", 3, 15, 1),
-]
-
-GROUPS = {
-    "Cardiac": {"HeartRate", "MeanBP", "SysBP", "DiasBP"},
-    "Respiratory": {"RespRate", "SaO2", "FiO2", "MechVent"},
-    "Blood gas": {"pH", "HCO3"},
-    "Bloods": {"Na", "K", "Mg", "Creatinine", "BUN", "Platelets", "HCT", "Glucose", "Lactate"},
-    "Other": {"GCS"},
-}
-
-TIMEPOINTS = [("t12", "12h ago"), ("t6", "6h ago"), ("tnow", "Now")]
-
-
-def render_manual_table() -> dict:
+# -----------------------------------------------------------------------------
+# Manual entry parsing + engineering into model features
+# -----------------------------------------------------------------------------
+def _parse_numeric(s: str, base: str) -> Tuple[Optional[float], Optional[str]]:
     """
-    Render manual input grid.
-    Returns raw input dict, structured as raw[var][timepoint] = value/None
+    Parse a numeric string, apply range checks, return (value, warning_message).
+    Blank => (None, None)
+    Non-numeric => (None, warning)
+    Out of range => (None, warning)
     """
-    raw: dict[str, dict[str, Any]] = {k: {} for (k, *_rest) in MANUAL_FIELDS}
+    s = (s or "").strip()
+    if s == "":
+        return None, None
 
-    for gname, keys in GROUPS.items():
-        st.subheader(gname)
+    try:
+        v = float(s)
+    except Exception:
+        lo, hi, unit = RANGES.get(base, (None, None, ""))
+        unit_txt = f" ({unit})" if unit else ""
+        return None, f"Please enter a number for {_label(base)}{unit_txt}."
 
-        # header row
-        cols = st.columns([2.2, 1.2, 1.2, 1.2])
-        cols[0].markdown("**Measurement**")
-        cols[1].markdown("**12h ago**")
-        cols[2].markdown("**6h ago**")
-        cols[3].markdown("**Now**")
-
-        for (var, label, wtype, vmin, vmax, step) in MANUAL_FIELDS:
-            if var not in keys:
-                continue
-
-            row = st.columns([2.2, 1.2, 1.2, 1.2])
-            row[0].write(label)
-
-            for j, (tkey, tlabel) in enumerate(TIMEPOINTS, start=1):
-                widget_key = f"manual__{var}__{tkey}"
-
-                if wtype == "bool":
-                    raw_val = row[j].selectbox(
-                        "",
-                        options=["", "No", "Yes"],
-                        index=0,
-                        key=widget_key,
-                        help="Leave blank if unknown.",
-                    )
-                    if raw_val == "":
-                        raw[var][tkey] = None
-                    else:
-                        raw[var][tkey] = 1.0 if raw_val == "Yes" else 0.0
-
-                elif wtype == "int":
-                    # allow blank via text_input -> parse later
-                    txt = row[j].text_input(
-                        "",
-                        value="",
-                        key=widget_key,
-                        placeholder="",
-                        help=f"Enter {int(vmin)}–{int(vmax)} or leave blank.",
-                    )
-                    raw[var][tkey] = txt
-
-                else:
-                    # numeric entry but allow blank using text_input so we don’t force 0s
-                    txt = row[j].text_input(
-                        "",
-                        value="",
-                        key=widget_key,
-                        placeholder="",
-                        help=f"Enter {vmin}–{vmax} or leave blank.",
-                    )
-                    raw[var][tkey] = txt
-
-        st.divider()
-
-    return raw
+    if base in RANGES:
+        lo, hi, unit = RANGES[base]
+        if v < lo or v > hi:
+            unit_txt = f" {unit}".strip()
+            unit_txt = f" {unit_txt}" if unit_txt else ""
+            return None, f"Please enter {_label(base)} between {lo:g} and {hi:g}{unit_txt}."
+    return v, None
 
 
-def parse_manual_raw(raw: dict) -> tuple[dict, list[str], int]:
+def _parse_yesno(s: str) -> Optional[int]:
+    if s == "Yes":
+        return 1
+    if s == "No":
+        return 0
+    return None
+
+
+def engineer_from_manual(
+    manual: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Any], int, List[str], Dict[str, List[str]]]:
     """
-    Parse raw manual strings into numbers where possible.
+    manual[base] = {"12h": val/None, "6h": val/None, "now": val/None}
     Returns:
-      - cleaned raw values (float or None)
-      - human-readable warnings
-      - count of raw variables entered (non-missing values across timepoints)
+      feats dict for model alignment
+      measurements_entered count (count of base variables with ANY input)
+      warnings list (clinician-friendly)
+      missing_by_time dict for UI (what user didn't enter)
     """
-    warnings: list[str] = []
-    entered = 0
+    feats: Dict[str, Any] = {}
+    warnings: List[str] = []
+    missing_by_time: Dict[str, List[str]] = {"12h": [], "6h": [], "now": []}
 
-    # build quick lookup for constraints
-    constraints = {var: (wtype, vmin, vmax) for (var, _lab, wtype, vmin, vmax, _step) in MANUAL_FIELDS}
+    measurements_entered = 0
 
-    cleaned: dict[str, dict[str, float | None]] = {k: {} for k in raw.keys()}
+    for base, tvals in manual.items():
+        v12 = tvals.get("12h", None)
+        v6 = tvals.get("6h", None)
+        vnow = tvals.get("now", None)
 
-    for var, tvals in raw.items():
-        wtype, vmin, vmax = constraints[var]
+        # Track missing by time (for UI only)
+        if v12 is None:
+            missing_by_time["12h"].append(_label(base))
+        if v6 is None:
+            missing_by_time["6h"].append(_label(base))
+        if vnow is None:
+            missing_by_time["now"].append(_label(base))
 
-        for tkey, val in tvals.items():
-            if val is None:
-                cleaned[var][tkey] = None
-                continue
+        vals = [v for v in [v12, v6, vnow] if v is not None]
 
-            # already converted bool -> float
-            if isinstance(val, (float, int)) and wtype == "bool":
-                cleaned[var][tkey] = float(val)
-                entered += 1
-                continue
-
-            # parse strings for int/num
-            if isinstance(val, str):
-                s = val.strip()
-                if s == "":
-                    cleaned[var][tkey] = None
-                    continue
-
-                try:
-                    f = float(s)
-                except Exception:
-                    # clinician-friendly warning
-                    warnings.append(f"“{constraints_label(var)}” at {timepoint_label(tkey)} wasn’t recognised as a number, so it was treated as unknown.")
-                    cleaned[var][tkey] = None
-                    continue
-
-                # range check
-                if vmin is not None and f < float(vmin):
-                    warnings.append(f"“{constraints_label(var)}” at {timepoint_label(tkey)} must be ≥ {vmin}. It was treated as unknown.")
-                    cleaned[var][tkey] = None
-                    continue
-                if vmax is not None and f > float(vmax):
-                    warnings.append(f"“{constraints_label(var)}” at {timepoint_label(tkey)} must be ≤ {vmax}. It was treated as unknown.")
-                    cleaned[var][tkey] = None
-                    continue
-
-                # int only if requested
-                if wtype == "int":
-                    f = float(int(round(f)))
-
-                cleaned[var][tkey] = float(f)
-                entered += 1
-                continue
-
-            # fallback
-            cleaned[var][tkey] = None
-
-    return cleaned, warnings, entered
-
-
-def constraints_label(var: str) -> str:
-    for (k, label, *_rest) in MANUAL_FIELDS:
-        if k == var:
-            return label
-    return var
-
-
-def timepoint_label(tkey: str) -> str:
-    return {"t12": "12h ago", "t6": "6h ago", "tnow": "Now"}.get(tkey, tkey)
-
-
-def engineer_from_manual(cleaned: dict) -> dict:
-    """
-    Turn manual timepoint values into engineered features the model expects.
-    Rules:
-      - If values exist: mean = mean of available timepoints, last = most recent available (Now > 6h > 12h)
-      - If none exist: leave mean/last as np.nan (NOT invented)
-      - MechVent additionally provides prop_on
-      - Adds *_was_measured flags
-    """
-    feat: dict[str, Any] = {}
-
-    # Most recent ordering
-    order = ["t12", "t6", "tnow"]
-
-    for (var, _label, _wtype, *_rest) in MANUAL_FIELDS:
-        vals = [cleaned[var].get(t) for t in order]
-        vals_num = [v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))]
-
-        if len(vals_num) == 0:
-            feat[f"{var}_was_measured"] = 0
-            feat[f"{var}_mean"] = np.nan
-            feat[f"{var}_last"] = np.nan
-            if var == "MechVent":
-                feat["MechVent_prop_on"] = np.nan
+        if len(vals) == 0:
+            feats[f"{base}_was_measured"] = 0
+            feats[f"{base}_mean"] = np.nan
+            feats[f"{base}_last"] = np.nan
             continue
 
-        feat[f"{var}_was_measured"] = 1
-        feat[f"{var}_mean"] = float(np.mean(vals_num))
+        measurements_entered += 1
+        feats[f"{base}_was_measured"] = 1
 
-        # last = most recent available among now -> 6h -> 12h
-        last_val = None
-        for t in ["tnow", "t6", "t12"]:
-            v = cleaned[var].get(t)
-            if v is not None and not (isinstance(v, float) and np.isnan(v)):
-                last_val = v
-                break
-        feat[f"{var}_last"] = float(last_val) if last_val is not None else np.nan
+        mean_val = float(np.mean(vals))
+        last_val = vnow if vnow is not None else (v6 if v6 is not None else v12)
 
-        if var == "MechVent":
-            mv = np.array(vals_num, dtype=float)
-            feat["MechVent_prop_on"] = float(np.mean(mv)) if mv.size else np.nan
+        feats[f"{base}_mean"] = mean_val
+        feats[f"{base}_last"] = float(last_val) if last_val is not None else np.nan
 
-    return feat
+        # special handling
+        if base == "MechVent":
+            mv = np.array(vals, dtype=float)
+            feats["MechVent_prop_on"] = float(np.mean(mv)) if mv.size else np.nan
+            feats["MechVent_last"] = float(last_val) if last_val is not None else np.nan
+
+    return feats, measurements_entered, warnings, missing_by_time
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # UI
-# -----------------------------
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="ICU Mortality Risk Demo", layout="centered")
 
 st.title("ICU Mortality Risk Demo")
 st.caption("For demonstration and education only — not a clinical decision tool.")
 
-# Bundle is fixed (repo-local)
-bundle_path = DEFAULT_BUNDLE_PATH
-if not bundle_path.exists():
-    st.error(
-        "Model bundle not found in the expected location. "
-        "Make sure outputs/model_bundle.joblib is committed in the repo."
-    )
+# Bundle must exist in repo
+if not BUNDLE_PATH.exists():
+    st.error("Model bundle not found. Expected: outputs/model_bundle.joblib")
     st.stop()
 
-bundle = load_bundle(bundle_path)
+bundle = load_bundle(BUNDLE_PATH)
 model = bundle["model"]
 imputer = bundle["imputer"]
-feature_columns = bundle["feature_columns"]
+feature_columns: List[str] = bundle["feature_columns"]
 
 thr_high = float(bundle.get("default_threshold", 0.5))
-thr_low = float(bundle.get("medium_threshold", DEFAULT_MEDIUM_THRESHOLD))  # low/high boundary naming legacy
-starter_vars = bundle.get("starter_vars", None)
+thr_medium = float(bundle.get("medium_threshold", DEFAULT_MEDIUM_THRESHOLD))
+thr_low = float(bundle.get("low_threshold", thr_medium))  # LOW is < thr_medium
 
-# Friendly wording: LOW threshold is thr_low
-low_thr = thr_low
-high_thr = thr_high
-
-with st.expander("What this tool does", expanded=False):
-    st.write(
-        "This tool estimates ICU mortality risk from observations (vitals / labs / blood gases). "
-        "It can either read a patient `.txt` file (demo format) or you can enter observations manually."
-    )
-    st.write(
-        "If some observations are missing, you can choose:"
-    )
-    st.markdown(
-        "- **Strict mode:** no estimate unless enough real data is provided.\n"
-        "- **Estimate mode:** missing values are filled using typical values from the model’s training data "
-        "(this will be clearly disclosed)."
-    )
-
-with st.expander("What data can I upload?", expanded=False):
-    st.write("Upload a single patient `.txt` file in the same format used in this demo project (e.g., PhysioNet-style).")
-    st.write("If you’re not sure, use **Manual entry** instead.")
-
-# Keep selection sticky
+# Keep input method stable across reruns
 if "input_method" not in st.session_state:
     st.session_state["input_method"] = "Manual entry"
 
-st.subheader("Choose input method")
-input_method = st.radio(
-    "",
-    ["Upload patient file", "Manual entry"],
-    index=1 if st.session_state["input_method"] == "Manual entry" else 0,
-    key="input_method_radio",
+st.markdown("### Choose input method")
+method = st.radio(
+    label="",
+    options=["Upload patient file", "Manual entry"],
+    index=0 if st.session_state["input_method"] == "Upload patient file" else 1,
+    key="input_method",
+    horizontal=True,
 )
-st.session_state["input_method"] = input_method
 
-# Prediction behaviour (sticky)
-if "mode" not in st.session_state:
-    st.session_state["mode"] = "Strict mode (needs enough real data)"
+st.divider()
 
-mode = st.selectbox(
-    "Prediction behaviour",
-    ["Strict mode (needs enough real data)", "Estimate mode (fills missing values)"],
-    index=0 if st.session_state["mode"].startswith("Strict") else 1,
-    help="Strict mode refuses to estimate if too much data is missing. Estimate mode will predict but will clearly show what was filled in.",
-)
-st.session_state["mode"] = mode
-
-
-def show_result_block(
-    prob: float,
-    low_thr: float,
-    high_thr: float,
-    X_imp: pd.DataFrame,
-    missing_features: list[str],
-    present_count: int,
-    raw_entered_count: int | None = None,
-    aligned_X: pd.DataFrame | None = None,
-):
-    band = risk_band(prob, low_thr, high_thr)
-
-    st.subheader("Result")
-    st.write(f"{band_dot(band)} **{band} RISK**")
-    st.metric("Estimated mortality risk", f"{prob*100:.2f}%")
-    st.caption(f"Model probability: {prob:.6f}")
-    st.caption(f"Risk bands: LOW < {low_thr:.2f}, MEDIUM {low_thr:.2f}–{high_thr:.3f}, HIGH ≥ {high_thr:.3f}")
-
-    st.subheader("What data was missing (and filled in by the model)")
-    if len(missing_features) == 0:
-        st.write("None — all model features were provided.")
-    else:
-        # Present missing in clinician-friendly grouped way
-        groups_hit = set()
-        for mf in missing_features:
-            base = mf.split("_")[0]
-            for gname, keys in GROUPS.items():
-                if base in keys:
-                    groups_hit.add(gname)
-        if groups_hit:
-            st.write(", ".join(sorted(groups_hit)))
-        else:
-            # fallback: show readable names
-            st.write(", ".join(pretty_label(m) for m in missing_features[:30]))
-
-    st.subheader("Why this risk estimate?")
-    st.caption("These are the top factors that increased the model’s estimate. This is not proof of causation.")
-    pushes = top_pushes_risk(X_imp, feature_columns, model, imputer, k=5)
-    if pushes.empty:
-        st.write("No clear top drivers were available for display.")
-    else:
-        # show only factor + your value (hide push score unless technical section)
-        disp = pushes[["Factor", "Your value"]].copy()
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    # Export (simple)
-    st.subheader("Export")
-    export = {
-        "probability": prob,
-        "risk_band": band,
-        "threshold_low": low_thr,
-        "threshold_high": high_thr,
-        "present_features": present_count,
-        "missing_features": [pretty_label(m) for m in missing_features],
-    }
-    if raw_entered_count is not None:
-        export["raw_variables_entered"] = raw_entered_count
-
-    st.download_button(
-        "Download summary (JSON)",
-        data=json.dumps(export, indent=2).encode("utf-8"),
-        file_name="icu_mortality_demo_summary.json",
-        mime="application/json",
+with st.expander("What this tool does", expanded=False):
+    st.write(
+        "It estimates mortality risk using a model trained on a public ICU dataset. "
+        "It can help you understand how an ML workflow turns observations into a risk estimate."
+    )
+    st.write(
+        "It **does not** replace clinical judgement. The thresholds are demonstration cut-offs and not validated for practice."
     )
 
-    # Technical details (single expander; NO nested expanders)
-    with st.expander("Technical details", expanded=False):
-        tab1, tab2, tab3 = st.tabs(["Engineered values", "Model feature alignment", "Environment"])
-        with tab1:
-            if aligned_X is not None:
-                # show only non-null engineered values
-                nonnull = aligned_X.iloc[0].dropna()
-                if nonnull.empty:
-                    st.write("No engineered values available.")
-                else:
-                    dfv = nonnull.reset_index()
-                    dfv.columns = ["Feature", "Value"]
-                    dfv["Feature"] = dfv["Feature"].apply(pretty_label)
-                    st.dataframe(dfv, use_container_width=True, hide_index=True)
-            else:
-                st.write("No engineered-value table available in this path.")
+with st.expander("What data can I upload?", expanded=False):
+    st.write(
+        "Upload a single patient `.txt` file from the same public dataset format used to train this demo. "
+        "For manual entry, enter values at 12h / 6h / Now. Leave unknown fields blank."
+    )
 
-        with tab2:
-            st.write(f"Features present: {present_count}/{len(feature_columns)}")
-            st.write(f"Missing features (imputed): {len(missing_features)}")
-            if len(missing_features) > 0:
-                st.write("Missing:")
-                st.write("\n".join(f"- {pretty_label(m)}" for m in missing_features))
+# Prediction mode (DEFAULT STRICT)
+st.markdown("### Prediction mode")
+mode = st.radio(
+    "",
+    ["Strict (recommended)", "Estimate (fills missing with typical training values)"],
+    index=0,
+    horizontal=False,
+)
+strict_mode = mode.startswith("Strict")
 
-        with tab3:
-            import sklearn
-            st.write(f"Python: {sys.version.split()[0]}")
-            st.write(f"scikit-learn: {sklearn.__version__}")
-            st.write(f"numpy: {np.__version__}")
-            st.write(f"pandas: {pd.__version__}")
-            st.write(f"joblib: {joblib.__version__}")
+if not strict_mode:
+    st.info(
+        "Estimate mode is ON: missing model inputs will be filled using typical values learned during training. "
+        "This will be clearly marked in the results."
+    )
 
-
-# -----------------------------
-# Upload mode
-# -----------------------------
-if input_method == "Upload patient file":
-    st.subheader("Upload patient file")
-
+# -----------------------------------------------------------------------------
+# UPLOAD MODE
+# -----------------------------------------------------------------------------
+if method == "Upload patient file":
     uploaded = st.file_uploader("Upload patient file (.txt)", type=["txt"])
+
     if uploaded is None:
         st.stop()
 
@@ -651,7 +475,6 @@ if input_method == "Upload patient file":
         st.error("File too large for this demo (max 2MB).")
         st.stop()
 
-    # Use temp file (no repo writes)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
         tmp.write(uploaded.getbuffer())
         tmp_path = Path(tmp.name)
@@ -662,25 +485,61 @@ if input_method == "Upload patient file":
 
         X_imp, present_count, missing_features, X_aligned = align_and_impute(feats, feature_columns, imputer)
 
-        # strict mode gate
-        if mode.startswith("Strict"):
-            if present_count < MIN_PRESENT_FEATURES_FOR_STRICT_UPLOAD:
-                st.warning(
-                    "Insufficient data to produce a risk estimate in **Strict mode**.\n\n"
-                    f"Provided model features: {present_count}/{len(feature_columns)}.\n\n"
-                    "Switch to **Estimate mode** if you want an approximate estimate that fills missing values "
-                    "using typical training values."
+        # Strict mode guardrail
+        if strict_mode:
+            if present_count < STRICT_MIN_PRESENT_FEATURES:
+                st.error(
+                    f"Insufficient data to make a reliable estimate in Strict mode.\n\n"
+                    f"- Model features available: {present_count}/{len(feature_columns)}\n"
+                    f"- Minimum required (demo rule): {STRICT_MIN_PRESENT_FEATURES}\n\n"
+                    "Add more data (or switch to Estimate mode)."
                 )
                 st.stop()
 
-        # estimate mode disclosure
-        if mode.startswith("Estimate"):
-            st.info(
-                f"Estimate mode is ON: {len(missing_features)} model features were missing and were filled using typical values from training data."
-            )
-
         prob = float(model.predict_proba(X_imp)[:, 1][0])
-        show_result_block(prob, low_thr, high_thr, X_imp, missing_features, present_count, aligned_X=X_aligned)
+        band = risk_band(prob, thr_medium, thr_high)
+
+        st.subheader("Result")
+        st.write(band_badge(band))
+        st.metric("Estimated mortality risk", f"{prob*100:.2f}%")
+        st.caption(f"Model probability: {prob:.6f}")
+        st.caption(f"Risk bands: LOW < {thr_medium:.2f}, MEDIUM {thr_medium:.2f}–{thr_high:.3f}, HIGH ≥ {thr_high:.3f}")
+
+        # Missing (specific, clinician-friendly)
+        st.subheader("What data was missing (and filled in by the model)")
+        missing_pretty = format_missing_features(missing_features)
+        if len(missing_pretty) == 0:
+            st.write("None — all model features were available from the uploaded data.")
+        else:
+            if strict_mode:
+                st.write(
+                    "Some model inputs were missing. In Strict mode, the app only proceeds if enough data is present overall."
+                )
+            else:
+                st.write("Missing inputs were filled using typical training values (Estimate mode).")
+
+            for item in missing_pretty:
+                st.write(f"• {item}")
+
+        # Explainability (always table)
+        st.subheader("Why this risk estimate?")
+        st.caption("Top factors that increased the model’s estimate. This is not proof of causation.")
+        drivers_df = compute_top_drivers(bundle, X_imp, X_aligned, feature_columns, top_n=5)
+        st.dataframe(drivers_df, use_container_width=True, hide_index=True)
+
+        # Transparency: engineered values available (no nested expanders!)
+        with st.expander("Engineered values (one row, pre-imputation)", expanded=False):
+            # show only non-null engineered values
+            row = pd.DataFrame([feats])
+            row = row.replace({pd.NA: np.nan})
+            nonnull = row.loc[:, row.notna().any(axis=0)]
+            st.dataframe(nonnull, use_container_width=True)
+
+        with st.expander("Technical details", expanded=False):
+            st.write(f"Bundle: {BUNDLE_PATH.as_posix()}")
+            st.write(f"Features expected: {len(feature_columns)}")
+            st.write(f"High threshold: {thr_high:.3f}")
+            st.write(f"Medium threshold: {thr_medium:.2f}")
 
     except Exception as e:
         st.error("Something went wrong while predicting.")
@@ -692,66 +551,166 @@ if input_method == "Upload patient file":
             pass
 
 
-# -----------------------------
-# Manual mode
-# -----------------------------
-else:
+# -----------------------------------------------------------------------------
+# MANUAL MODE
+# -----------------------------------------------------------------------------
+if method == "Manual entry":
     st.subheader("Manual entry")
     st.caption("Enter observations at up to three timepoints. Leave blank if unknown.")
 
-    raw = render_manual_table()
+    # Manual entry UI helpers
+    def _row_numeric(base: str, key_prefix: str):
+        c0, c1, c2, c3 = st.columns([2.2, 1.2, 1.2, 1.2])
+        c0.write(_label(base))
 
-    cleaned, warnings, entered_count = parse_manual_raw(raw)
+        v12 = c1.text_input("", key=f"{key_prefix}_{base}_12h", placeholder="", label_visibility="collapsed")
+        v6 = c2.text_input("", key=f"{key_prefix}_{base}_6h", placeholder="", label_visibility="collapsed")
+        vnow = c3.text_input("", key=f"{key_prefix}_{base}_now", placeholder="", label_visibility="collapsed")
 
-    st.subheader("Data check")
-    st.write(f"Variables entered: **{entered_count}**")
+        parsed = {}
+        for t, raw in [("12h", v12), ("6h", v6), ("now", vnow)]:
+            val, warn = _parse_numeric(raw, base)
+            if warn:
+                st.warning(warn)
+            parsed[t] = val
+        return parsed
 
-    for w in warnings[:8]:
-        st.warning(w)
-    if len(warnings) > 8:
-        st.warning(f"...and {len(warnings) - 8} more entries were treated as unknown.")
+    def _row_yesno(base: str, key_prefix: str):
+        c0, c1, c2, c3 = st.columns([2.2, 1.2, 1.2, 1.2])
+        c0.write(_label(base))
+        v12 = c1.selectbox("", ["Unknown", "No", "Yes"], key=f"{key_prefix}_{base}_12h", label_visibility="collapsed")
+        v6 = c2.selectbox("", ["Unknown", "No", "Yes"], key=f"{key_prefix}_{base}_6h", label_visibility="collapsed")
+        vnow = c3.selectbox("", ["Unknown", "No", "Yes"], key=f"{key_prefix}_{base}_now", label_visibility="collapsed")
+        return {"12h": _parse_yesno(v12), "6h": _parse_yesno(v6), "now": _parse_yesno(vnow)}
 
-    # Build engineered features from manual
-    engineered = engineer_from_manual(cleaned)
+    st.write("")  # spacing
 
-    # Calculate button (keep app on manual selection)
-    clicked = st.button("Calculate risk", type="primary")
-    if not clicked:
-        st.stop()
+    st.markdown("#### Cardiac")
+    st.caption("Measurement | 12h ago | 6h ago | Now")
+    manual_inputs: Dict[str, Dict[str, Any]] = {}
+    manual_inputs["HeartRate"] = _row_numeric("HeartRate", "m")
+    manual_inputs["MeanBP"] = _row_numeric("MeanBP", "m")
+    manual_inputs["SysBP"] = _row_numeric("SysBP", "m")
+    manual_inputs["DiasBP"] = _row_numeric("DiasBP", "m")
 
-    try:
-        X_imp, present_count, missing_features, X_aligned = align_and_impute(engineered, feature_columns, imputer)
+    st.markdown("#### Respiratory")
+    st.caption("Measurement | 12h ago | 6h ago | Now")
+    manual_inputs["RespRate"] = _row_numeric("RespRate", "m")
+    manual_inputs["SaO2"] = _row_numeric("SaO2", "m")
+    manual_inputs["FiO2"] = _row_numeric("FiO2", "m")
+    manual_inputs["MechVent"] = _row_yesno("MechVent", "m")
 
-        # strict mode gate (manual uses raw-entered variables)
-        if mode.startswith("Strict"):
-            if entered_count < MIN_RAW_VARIABLES_FOR_STRICT_MANUAL:
-                st.warning(
-                    "Insufficient data to produce a risk estimate in **Strict mode**.\n\n"
-                    f"You entered {entered_count} values. Minimum recommended: {MIN_RAW_VARIABLES_FOR_STRICT_MANUAL}.\n\n"
-                    "Switch to **Estimate mode** if you want an approximate estimate that fills missing values "
-                    "using typical training values."
+    st.markdown("#### Blood gas")
+    st.caption("Measurement | 12h ago | 6h ago | Now")
+    manual_inputs["pH"] = _row_numeric("pH", "m")
+    manual_inputs["HCO3"] = _row_numeric("HCO3", "m")
+
+    st.markdown("#### Bloods")
+    st.caption("Measurement | 12h ago | 6h ago | Now")
+    manual_inputs["Na"] = _row_numeric("Na", "m")
+    manual_inputs["K"] = _row_numeric("K", "m")
+    manual_inputs["Mg"] = _row_numeric("Mg", "m")
+    manual_inputs["Creatinine"] = _row_numeric("Creatinine", "m")
+    manual_inputs["BUN"] = _row_numeric("BUN", "m")
+    manual_inputs["Platelets"] = _row_numeric("Platelets", "m")
+    manual_inputs["HCT"] = _row_numeric("HCT", "m")
+    manual_inputs["Glucose"] = _row_numeric("Glucose", "m")
+    manual_inputs["Lactate"] = _row_numeric("Lactate", "m")
+
+    st.markdown("#### Other")
+    st.caption("Measurement | 12h ago | 6h ago | Now")
+    manual_inputs["GCS"] = _row_numeric("GCS", "m")
+
+    st.divider()
+
+    # Calculate button
+    if st.button("Calculate risk", type="primary"):
+        try:
+            feats, measurements_entered, warnings, missing_by_time = engineer_from_manual(manual_inputs)
+
+            X_imp, present_count, missing_features, X_aligned = align_and_impute(feats, feature_columns, imputer)
+
+            st.subheader("Data check")
+            st.write(f"Measurements entered: **{measurements_entered}**")
+            st.write(f"Model features available (derived from those): **{present_count}/{len(feature_columns)}**")
+            missing_count = len(missing_features)
+            st.write(f"Missing model features (filled if Estimate mode): **{missing_count}**")
+
+            # Strict mode guardrail
+            if strict_mode:
+                if present_count < STRICT_MIN_PRESENT_FEATURES or measurements_entered < STRICT_MIN_MEASUREMENTS_ENTERED:
+                    st.error(
+                        "Insufficient data to make a reliable estimate in Strict mode.\n\n"
+                        f"- Measurements entered: {measurements_entered} (min {STRICT_MIN_MEASUREMENTS_ENTERED})\n"
+                        f"- Model features available: {present_count}/{len(feature_columns)} (min {STRICT_MIN_PRESENT_FEATURES})\n\n"
+                        "Enter more observations (or switch to Estimate mode)."
+                    )
+                    st.stop()
+
+            prob = float(model.predict_proba(X_imp)[:, 1][0])
+            band = risk_band(prob, thr_medium, thr_high)
+
+            st.subheader("Result")
+            st.write(band_badge(band))
+            st.metric("Estimated mortality risk", f"{prob*100:.2f}%")
+            st.caption(f"Model probability: {prob:.6f}")
+            st.caption(f"Risk bands: LOW < {thr_medium:.2f}, MEDIUM {thr_medium:.2f}–{thr_high:.3f}, HIGH ≥ {thr_high:.3f}")
+
+            # Missing UI: show specific missing model features (not just categories)
+            st.subheader("What data was missing (and filled in by the model)")
+            missing_pretty = format_missing_features(missing_features)
+
+            if len(missing_pretty) == 0:
+                st.write("None — all model features were available from your entries.")
+            else:
+                if strict_mode:
+                    st.write(
+                        "Some model inputs are missing. In Strict mode, the app only proceeds if enough data is present overall."
+                    )
+                else:
+                    st.write("Missing inputs were filled using typical training values (Estimate mode).")
+
+                for item in missing_pretty:
+                    st.write(f"• {item}")
+
+            # Explainability (always table)
+            st.subheader("Why this risk estimate?")
+            st.caption("Top factors that increased the model’s estimate. This is not proof of causation.")
+            drivers_df = compute_top_drivers(bundle, X_imp, X_aligned, feature_columns, top_n=5)
+            st.dataframe(drivers_df, use_container_width=True, hide_index=True)
+
+            # Transparency: engineered values explanation (simple + clinician-friendly)
+            with st.expander("How manual entries become model inputs", expanded=False):
+                st.write(
+                    "For each measurement, the model uses two engineered values:\n"
+                    "- **Average**: mean of any values you entered across 12h / 6h / Now.\n"
+                    "- **Latest**: the most recent value you entered (Now → 6h → 12h).\n\n"
+                    "If you leave a measurement blank at all timepoints, it remains missing."
                 )
-                st.stop()
 
-        # estimate mode disclosure
-        if mode.startswith("Estimate"):
-            st.info(
-                f"Estimate mode is ON: {len(missing_features)} model features were missing and were filled using typical values from training data."
-            )
+            with st.expander("Engineered values available (pre-imputation)", expanded=False):
+                row = pd.DataFrame([feats]).replace({pd.NA: np.nan})
+                nonnull = row.loc[:, row.notna().any(axis=0)]
+                st.dataframe(nonnull, use_container_width=True)
 
-        prob = float(model.predict_proba(X_imp)[:, 1][0])
+            with st.expander("What you did not enter (by timepoint)", expanded=False):
+                c1, c2, c3 = st.columns(3)
+                c1.write("**12h ago missing**")
+                for x in sorted(missing_by_time["12h"]):
+                    c1.write(f"• {x}")
+                c2.write("**6h ago missing**")
+                for x in sorted(missing_by_time["6h"]):
+                    c2.write(f"• {x}")
+                c3.write("**Now missing**")
+                for x in sorted(missing_by_time["now"]):
+                    c3.write(f"• {x}")
 
-        show_result_block(
-            prob,
-            low_thr,
-            high_thr,
-            X_imp,
-            missing_features,
-            present_count,
-            raw_entered_count=entered_count,
-            aligned_X=X_aligned,
-        )
+            with st.expander("Technical details", expanded=False):
+                st.write(f"Bundle: {BUNDLE_PATH.as_posix()}")
+                st.write(f"Features expected: {len(feature_columns)}")
+                st.write(f"High threshold: {thr_high:.3f}")
+                st.write(f"Medium threshold: {thr_medium:.2f}")
 
-    except Exception as e:
-        st.error("Something went wrong while predicting.")
-        st.exception(e)
+        except Exception as e:
+            st.error("Something went wrong while predicting.")
+            st.exception(e)
