@@ -528,7 +528,7 @@ st.session_state["input_method"] = input_method
 
 # Prediction behaviour (sticky)
 if "mode" not in st.session_state:
-    st.session_state["mode"] = "Estimate mode (fills missing values)"
+    st.session_state["mode"] = "Strict mode (needs enough real data)"
 
 mode = st.selectbox(
     "Prediction behaviour",
